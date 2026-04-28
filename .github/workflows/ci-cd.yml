@@ -41,7 +41,7 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GHCR_TOKEN }}
+          password: ${{ secrets.GHCR_TOKEN || github.token }}
 
       - name: Extract metadata
         id: meta
@@ -72,6 +72,9 @@ jobs:
       (needs.build.result == 'success' || github.event.inputs.deploy_only == 'true') &&
       github.ref == 'refs/heads/main'
     environment: production
+    permissions:
+      contents: read
+      packages: read
 
     steps:
       - uses: actions/checkout@v4
@@ -99,30 +102,44 @@ jobs:
         run: |
           if [ -n "$ENV_FILE" ]; then
             echo "Updating .env file on server..."
-            printf '%s' "$ENV_FILE" | ssh $VPS_USER@$VPS_HOST "cat > /tmp/cliproxy.env && sudo install -m 600 -o root -g root /tmp/cliproxy.env /home/$VPS_USER/genfity/ai-core2/.env && rm -f /tmp/cliproxy.env"
+            printf '%s' "$ENV_FILE" | ssh $VPS_USER@$VPS_HOST "mkdir -p /home/$VPS_USER/genfity/ai-core2 && cat > /tmp/cliproxy.env && sudo install -m 600 -o root -g root /tmp/cliproxy.env /home/$VPS_USER/genfity/ai-core2/.env && rm -f /tmp/cliproxy.env"
           fi
           if [ -n "$CONFIG_YAML" ]; then
             echo "Updating config.yaml file on server..."
-            printf '%s' "$CONFIG_YAML" | ssh $VPS_USER@$VPS_HOST "cat > /tmp/cliproxy.yaml && sudo install -m 600 -o root -g root /tmp/cliproxy.yaml /home/$VPS_USER/genfity/ai-core2/config.yaml && rm -f /tmp/cliproxy.yaml"
+            printf '%s' "$CONFIG_YAML" | ssh $VPS_USER@$VPS_HOST "mkdir -p /home/$VPS_USER/genfity/ai-core2 && cat > /tmp/cliproxy.yaml && sudo install -m 600 -o root -g root /tmp/cliproxy.yaml /home/$VPS_USER/genfity/ai-core2/config.yaml && rm -f /tmp/cliproxy.yaml"
           fi
 
       - name: Deploy with Docker Compose
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
         run: |
+          if [ -z "$GHCR_TOKEN" ]; then
+            echo "GHCR_TOKEN or github.token is required for deployment"
+            exit 1
+          fi
+
           ssh $VPS_USER@$VPS_HOST << ENDSSH
+            set -e
+            mkdir -p ~/genfity/ai-core2
             cd ~/genfity/ai-core2
 
-            # Pull config from git if needed
-            git remote set-url origin https://x-access-token:${GHCR_TOKEN}@github.com/${{ github.repository }}.git
-            git fetch origin main
-            git reset --hard origin/main
+            if [ -d .git ]; then
+              git remote set-url origin https://x-access-token:${GHCR_TOKEN}@github.com/${{ github.repository }}.git
+              git fetch origin main
+              git reset --hard origin/main
+            elif [ -f docker-compose.yml ]; then
+              echo "Deploy directory is not a git repository; using existing docker-compose.yml"
+            else
+              git clone https://x-access-token:${GHCR_TOKEN}@github.com/${{ github.repository }}.git .
+            fi
+
+            echo "${GHCR_TOKEN}" | sudo docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
 
             export CLI_PROXY_IMAGE=ghcr.io/${{ env.IMAGE_NAME }}:latest
-            sudo -E docker compose pull
-            sudo -E docker compose up -d --force-recreate
+            sudo -E docker compose pull cli-proxy-api
+            sudo -E docker compose up -d --force-recreate cli-proxy-api
 
             sudo docker image prune -af --filter "until=24h" 2>/dev/null || true
           ENDSSH
@@ -134,7 +151,7 @@ jobs:
         run: |
           sleep 15
           ssh $VPS_USER@$VPS_HOST << 'ENDSSH'
-            if curl -sf http://localhost:8317/v1/models > /dev/null 2>&1; then
+            if curl -sf http://localhost:8317/healthz > /dev/null 2>&1; then
               echo "Health check passed!"
               exit 0
             fi
