@@ -121,13 +121,21 @@ jobs:
 
           ssh $VPS_USER@$VPS_HOST << ENDSSH
             set -euo pipefail
+            mkdir -p ~/genfity/ai-core2
             cd ~/genfity/ai-core2
 
-            # Force pull latest changes (override local, no conflicts)
-            git remote set-url origin https://x-access-token:${GHCR_TOKEN}@github.com/${{ github.repository }}.git
-            git fetch origin main
-            git reset --hard origin/main
-            git remote set-url origin https://github.com/${{ github.repository }}.git
+            if [ -d .git ]; then
+              # Force pull latest changes (override local, no conflicts)
+              git remote set-url origin https://x-access-token:${GHCR_TOKEN}@github.com/${{ github.repository }}.git
+              git fetch origin main
+              git reset --hard origin/main
+              git remote set-url origin https://github.com/${{ github.repository }}.git
+            elif [ -f docker-compose.yml ]; then
+              echo "Deploy directory is not a git repository; using existing docker-compose.yml"
+            else
+              git clone https://x-access-token:${GHCR_TOKEN}@github.com/${{ github.repository }}.git .
+              git remote set-url origin https://github.com/${{ github.repository }}.git
+            fi
 
             # Login to GHCR
             echo "$GHCR_TOKEN" | sudo docker login ghcr.io -u mygads --password-stdin
