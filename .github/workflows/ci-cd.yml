@@ -131,7 +131,12 @@ jobs:
               git reset --hard origin/main
               git remote set-url origin https://github.com/${{ github.repository }}.git
             elif [ -f docker-compose.yml ]; then
-              echo "Deploy directory is not a git repository; using existing docker-compose.yml"
+              echo "Deploy directory is not a git repository; initializing it from GitHub"
+              git init
+              git remote add origin https://x-access-token:${GHCR_TOKEN}@github.com/${{ github.repository }}.git
+              git fetch origin main
+              git reset --hard origin/main
+              git remote set-url origin https://github.com/${{ github.repository }}.git
             else
               git clone https://x-access-token:${GHCR_TOKEN}@github.com/${{ github.repository }}.git .
               git remote set-url origin https://github.com/${{ github.repository }}.git
@@ -143,15 +148,20 @@ jobs:
             # Set image and deploy using docker compose
             export CLI_PROXY_IMAGE=ghcr.io/mygads/cli-proxy-api:latest
 
-            # Pull latest image
-            sudo -E docker compose pull
+            # Pull latest image. If GHCR denies access, build from the checked-out source instead.
+            if sudo -E docker compose pull; then
+              UP_COMMAND="sudo -E docker compose up -d --force-recreate"
+            else
+              echo "docker compose pull failed, building cli-proxy-api from local source instead..."
+              UP_COMMAND="sudo -E docker compose up -d --force-recreate --build --pull never cli-proxy-api"
+            fi
 
             # First attempt; if Docker networking/iptables is stale, restart Docker once and retry.
-            if ! sudo -E docker compose up -d --force-recreate; then
+            if ! eval "$UP_COMMAND"; then
               echo "docker compose up failed, restarting Docker daemon and retrying once..."
               sudo systemctl restart docker
               sleep 5
-              sudo -E docker compose up -d --force-recreate
+              eval "$UP_COMMAND"
             fi
 
             # Wait for service to be ready
