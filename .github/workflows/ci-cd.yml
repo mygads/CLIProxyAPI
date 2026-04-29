@@ -85,6 +85,7 @@ jobs:
           echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts
+          printf 'Host *\n  ServerAliveInterval 60\n  ServerAliveCountMax 10\n' >> ~/.ssh/config
 
       - name: Verify secrets
         run: |
@@ -113,35 +114,54 @@ jobs:
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
         run: |
-          if [ -z "$GHCR_TOKEN" ]; then
-            echo "GHCR_TOKEN or github.token is required for deployment"
-            exit 1
-          fi
+          set -euo pipefail
+          echo "Deploying CLI Proxy API with docker compose..."
 
           ssh $VPS_USER@$VPS_HOST << ENDSSH
-            set -e
-            mkdir -p ~/genfity/ai-core2
+            set -euo pipefail
             cd ~/genfity/ai-core2
 
-            if [ -d .git ]; then
-              git remote set-url origin https://x-access-token:${GHCR_TOKEN}@github.com/${{ github.repository }}.git
-              git fetch origin main
-              git reset --hard origin/main
-            elif [ -f docker-compose.yml ]; then
-              echo "Deploy directory is not a git repository; using existing docker-compose.yml"
-            else
-              git clone https://x-access-token:${GHCR_TOKEN}@github.com/${{ github.repository }}.git .
+            # Force pull latest changes (override local, no conflicts)
+            git remote set-url origin https://x-access-token:${GHCR_TOKEN}@github.com/${{ github.repository }}.git
+            git fetch origin main
+            git reset --hard origin/main
+            git remote set-url origin https://github.com/${{ github.repository }}.git
+
+            # Login to GHCR
+            echo "$GHCR_TOKEN" | sudo docker login ghcr.io -u mygads --password-stdin
+
+            # Set image and deploy using docker compose
+            export CLI_PROXY_IMAGE=ghcr.io/mygads/cli-proxy-api:latest
+
+            # Pull latest image
+            sudo -E docker compose pull
+
+            # First attempt; if Docker networking/iptables is stale, restart Docker once and retry.
+            if ! sudo -E docker compose up -d --force-recreate; then
+              echo "docker compose up failed, restarting Docker daemon and retrying once..."
+              sudo systemctl restart docker
+              sleep 5
+              sudo -E docker compose up -d --force-recreate
             fi
 
-            echo "${GHCR_TOKEN}" | sudo docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
+            # Wait for service to be ready
+            echo "Waiting for service to be ready..."
+            sleep 15
 
-            export CLI_PROXY_IMAGE=ghcr.io/${{ env.IMAGE_NAME }}:latest
-            sudo -E docker compose pull cli-proxy-api
-            sudo -E docker compose up -d --force-recreate cli-proxy-api
+            # Check container status
+            if ! sudo docker ps --filter "name=^/cli-proxy-api$" --filter "status=running" | grep -q cli-proxy-api; then
+              echo "cli-proxy-api container is not running after deploy"
+              sudo docker ps -a | grep cli-proxy-api || true
+              sudo docker logs cli-proxy-api --tail 50 || true
+              exit 1
+            fi
 
+            # Cleanup old images
             sudo docker image prune -af --filter "until=24h" 2>/dev/null || true
+
+            echo "Deployment complete!"
           ENDSSH
 
       - name: Health Check
@@ -149,12 +169,20 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
         run: |
+          echo "Running health check..."
           sleep 15
+
           ssh $VPS_USER@$VPS_HOST << 'ENDSSH'
-            if curl -sf http://localhost:8317/healthz > /dev/null 2>&1; then
-              echo "Health check passed!"
-              exit 0
-            fi
+            for i in {1..5}; do
+              if curl -sf http://localhost:8317/healthz > /dev/null 2>&1; then
+                echo "Health check passed!"
+                sudo docker ps | grep cli-proxy-api
+                exit 0
+              fi
+              echo "Attempt $i failed, retrying..."
+              sleep 5
+            done
+
             echo "Health check failed!"
             sudo docker logs cli-proxy-api --tail 50
             exit 1
