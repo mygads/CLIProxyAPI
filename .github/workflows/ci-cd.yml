@@ -157,11 +157,11 @@ jobs:
             fi
 
             # First attempt; if Docker networking/iptables is stale, restart Docker once and retry.
-            if ! eval "$UP_COMMAND"; then
+            if ! eval "\$UP_COMMAND"; then
               echo "docker compose up failed, restarting Docker daemon and retrying once..."
               sudo systemctl restart docker
               sleep 5
-              eval "$UP_COMMAND"
+              eval "\$UP_COMMAND"
             fi
 
             # Wait for service to be ready
