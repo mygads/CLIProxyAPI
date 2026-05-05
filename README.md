@@ -53,7 +53,7 @@ VisionCoder is also offering our users a limited-time <a href="https://coder.vis
 - OpenAI Codex support (GPT models) via OAuth login
 - Claude Code support via OAuth login
 - Amp CLI and IDE extensions support with provider routing
-- Streaming and non-streaming responses
+- Streaming, non-streaming, and WebSocket responses where supported
 - Function calling/tools support
 - Multimodal input support (text and images)
 - Multiple accounts with round-robin load balancing (Gemini, OpenAI, Claude)
@@ -81,6 +81,10 @@ Since v6.10.0, CLIProxyAPI and [CPAMC](https://github.com/router-for-me/Cli-Prox
 ### [CPA Usage Keeper](https://github.com/Willxup/cpa-usage-keeper)
 
 Standalone persistence and visualization service for CLIProxyAPI, with periodic data sync, SQLite storage, aggregate APIs, and a built-in dashboard for usage and statistics.
+
+### [CLIProxyAPI Usage Dashboard](https://github.com/zhanglunet/cliproxyapi-usage-dashboard)
+
+Local-first usage and quota dashboard for CLIProxyAPI. It collects per-request token usage from the Redis-compatible usage queue into SQLite, visualizes daily and recent-window usage by account and model, and shows Codex 5h/7d quota remaining in a local web UI.
 
 ## Amp CLI Support
 
@@ -130,7 +134,7 @@ Native macOS menu bar app to use your Claude Code & ChatGPT subscriptions with A
 
 ### [Subtitle Translator](https://github.com/VjayC/SRT-Subtitle-Translator-Validator)
 
-Browser-based tool to translate SRT subtitles using your Gemini subscription via CLIProxyAPI with automatic validation/error correction - no API keys needed
+A cross-platform desktop and web app to translate and validate SRT subtitles using your existing LLM subscriptions (Gemini, ChatGPT, Claude, etc.) via CLIProxyAPI - no API keys needed.
 
 ### [CCS (Claude Code Switch)](https://github.com/kaitranntt/ccs)
 
@@ -194,6 +198,10 @@ Ready-to-use cross-platform quota inspector for CLIProxyAPI, supporting per-acco
 ### [CodexCliPlus](https://github.com/C4AL/CodexCliPlus)
 
 Windows-focused, local-first desktop management platform for Codex CLI built on CLIProxyAPI, focused on simplifying local setup, account and runtime management, and providing a more complete Codex CLI experience for local users.
+
+### [CLIProxy Pool Watch](https://github.com/murasame612/CLIProxyPoolWidget)
+
+Native macOS SwiftUI app for monitoring ChatGPT/Codex account quotas in CLIProxyAPI pools. Displays account availability, Plus-base capacity, 5-hour and weekly quota bars, plan weights, and restore forecasts through the Management API.
 
 > [!NOTE]  
 > If you developed a project based on CLIProxyAPI, please open a PR to add it to this list.
