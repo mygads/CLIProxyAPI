@@ -83,6 +83,22 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 		filteredModels[i] = filteredModel
 	}
 
+	// Append virtual combos (named fallback chains) so clients can see and
+	// call them by name. We use object:"combo" to make them distinguishable
+	// from real upstream models; OpenAI-compatible clients still treat
+	// anything with a string `id` as callable, which is what we want.
+	if h.Combos != nil {
+		if lister, ok := h.Combos.(interface{ ListNames() []string }); ok {
+			for _, name := range lister.ListNames() {
+				filteredModels = append(filteredModels, map[string]any{
+					"id":       name,
+					"object":   "combo",
+					"owned_by": "genfity",
+				})
+			}
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",
 		"data":   filteredModels,

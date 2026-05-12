@@ -1487,12 +1487,17 @@ func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix boo
 		if baseID == "" {
 			continue
 		}
-		if !forceModelPrefix || trimmedPrefix == baseID {
-			addModel(model)
-		}
+		// Always publish the prefixed form so /v1/models exposes "{prefix}/{model}".
 		clone := *model
 		clone.ID = trimmedPrefix + "/" + baseID
 		addModel(&clone)
+		// In strict mode (the default) we intentionally do not publish the bare
+		// model ID. This is what prevents prefix leakage: a request for "gpt-5.5"
+		// will not match a credential whose prefix is "cdx" — the client must ask
+		// for "cdx/gpt-5.5" explicitly.
+		if !forceModelPrefix {
+			addModel(model)
+		}
 	}
 	return out
 }

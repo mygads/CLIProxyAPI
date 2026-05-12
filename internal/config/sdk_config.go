@@ -23,9 +23,17 @@ type SDKConfig struct {
 	// Default is false for safety; when false, /v1internal:* requests are rejected.
 	EnableGeminiCLIEndpoint bool `yaml:"enable-gemini-cli-endpoint" json:"enable-gemini-cli-endpoint"`
 
-	// ForceModelPrefix requires explicit model prefixes (e.g., "teamA/gemini-3-pro-preview")
-	// to target prefixed credentials. When false, unprefixed model requests may use prefixed
-	// credentials as well.
+	// ForceModelPrefix requires explicit model prefixes (e.g., "cc/claude-opus-4-7")
+	// to target prefixed credentials.
+	//
+	// Default: true (strict mode). When the config key is absent it is treated as true.
+	//   - Prefixed credentials only publish "{prefix}/{model}" entries on /v1/models.
+	//   - Requests without a matching prefix bypass prefixed credentials entirely,
+	//     which prevents cross-provider leakage (e.g. "gpt-5.5" falling through to
+	//     both Codex and OpenRouter credentials at the same time).
+	//
+	// Set to false only to restore the legacy permissive behavior where unprefixed
+	// requests may be served by any credential regardless of its Prefix.
 	ForceModelPrefix bool `yaml:"force-model-prefix" json:"force-model-prefix"`
 
 	// RequestLog enables or disables detailed request logging functionality.

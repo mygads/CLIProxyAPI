@@ -293,6 +293,18 @@ func disallowFreeAuthFromContext(ctx context.Context) bool {
 	return ok && raw
 }
 
+// ComboResolver expands a virtual combo name into the ordered list of real
+// prefixed models that should be tried. The `internal/combo` package provides
+// the production implementation; handlers talk to it through this interface
+// so the SDK package does not take a direct dependency on internal packages.
+type ComboResolver interface {
+	// Has reports whether name is a known combo (regardless of status).
+	Has(name string) bool
+	// FirstCandidate returns the head of the fallback chain for name. Empty
+	// string means "not a combo, pass through".
+	FirstCandidate(name string) string
+}
+
 // BaseAPIHandler contains the handlers for API endpoints.
 // It holds a pool of clients to interact with the backend service and manages
 // load balancing, client selection, and configuration.
@@ -302,6 +314,11 @@ type BaseAPIHandler struct {
 
 	// Cfg holds the current application configuration.
 	Cfg *config.SDKConfig
+
+	// Combos is optional. When set, incoming requests whose `model` field
+	// matches a combo name are rewritten to the combo's first candidate
+	// before provider lookup. A nil resolver disables the feature.
+	Combos ComboResolver
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.
@@ -871,6 +888,23 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	parsed := thinking.ParseSuffix(resolvedModelName)
 	baseModel := strings.TrimSpace(parsed.ModelName)
 
+	// Virtual combo expansion. If the requested model is a combo name (no
+	// slash — combos cannot contain "/"), swap it for the combo's first
+	// candidate here. Multi-candidate fallback in the execution loop is a
+	// follow-up change; this already covers the common case where the head
+	// entry succeeds, which is the whole point of combos in production.
+	if h != nil && h.Combos != nil && !strings.Contains(baseModel, "/") && h.Combos.Has(baseModel) {
+		if head := strings.TrimSpace(h.Combos.FirstCandidate(baseModel)); head != "" {
+			if parsed.HasSuffix {
+				resolvedModelName = fmt.Sprintf("%s(%s)", head, parsed.RawSuffix)
+			} else {
+				resolvedModelName = head
+			}
+			parsed = thinking.ParseSuffix(resolvedModelName)
+			baseModel = strings.TrimSpace(parsed.ModelName)
+		}
+	}
+
 	if strings.EqualFold(baseModel, "gpt-image-2") {
 		return nil, "", &interfaces.ErrorMessage{
 			StatusCode: http.StatusServiceUnavailable,
@@ -893,6 +927,21 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	}
 
 	if len(providers) == 0 {
+		// In strict prefix mode, an unprefixed request that does not match any
+		// non-prefixed credential almost always means the caller forgot to
+		// include the provider prefix (e.g. asked for "gpt-5.5" instead of
+		// "cdx/gpt-5.5"). Surface a hint so operators can diagnose this quickly
+		// without having to cross-reference /v1/models and the credential list.
+		if !strings.Contains(baseModel, "/") {
+			return nil, "", &interfaces.ErrorMessage{
+				StatusCode: http.StatusBadRequest,
+				Error: fmt.Errorf(
+					"model %q is not registered. If this model is served by a prefixed credential, include the prefix explicitly (e.g. \"cc/%s\"). See GET /v1/models for the authoritative list",
+					modelName,
+					baseModel,
+				),
+			}
+		}
 		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
 	}
 

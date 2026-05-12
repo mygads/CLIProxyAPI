@@ -631,6 +631,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	// Default to strict prefix enforcement. When the key is absent from YAML, prefixed
+	// credentials only serve requests that explicitly include their prefix, preventing
+	// cross-provider leakage (e.g. a bare `gpt-5.5` request accidentally matching both
+	// Codex and OpenRouter credentials).
+	cfg.ForceModelPrefix = true
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.

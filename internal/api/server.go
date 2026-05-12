@@ -29,6 +29,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/modules"
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v7/internal/api/modules/amp"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/combo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -173,6 +174,11 @@ type Server struct {
 	// management handler
 	mgmt *managementHandlers.Handler
 
+	// Virtual combo registry (named fallback chains). Nil until initialised
+	// in NewServer. See internal/combo + PRD §3.3.
+	combos     *combo.Registry
+	comboStore *combo.FileStore
+
 	// ampModule is the Amp routing module for model mapping hot-reload
 	ampModule *ampmodule.AmpModule
 
@@ -288,6 +294,30 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		s.mgmt.SetPostAuthHook(optionState.postAuthHook)
 	}
 	s.localPassword = optionState.localPassword
+
+	// Virtual combo registry. Persisted next to the other auth data under
+	// <auth-dir>/combos.json. A load failure is logged but not fatal — an
+	// empty registry still lets the server boot.
+	{
+		authDir := strings.TrimSpace(cfg.AuthDir)
+		if authDir == "" {
+			authDir = "."
+		}
+		comboReg := combo.NewRegistry()
+		comboStore := combo.NewFileStore(filepath.Join(authDir, "combos.json"))
+		if err := comboStore.Load(comboReg); err != nil {
+			log.Warnf("combo store: %v", err)
+		}
+		s.combos = comboReg
+		s.comboStore = comboStore
+		s.mgmt.SetComboRegistry(comboReg, comboStore)
+		// Expose the registry to the request path so combo names in
+		// `model` fields are rewritten to their first candidate before
+		// the provider lookup runs.
+		if s.handlers != nil {
+			s.handlers.Combos = comboReg
+		}
+	}
 
 	// Home heartbeat gate: when home is enabled, block all endpoints with 503 until the
 	// subscribe-config heartbeat connection is healthy.
@@ -635,6 +665,14 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/force-model-prefix", s.mgmt.GetForceModelPrefix)
 		mgmt.PUT("/force-model-prefix", s.mgmt.PutForceModelPrefix)
 		mgmt.PATCH("/force-model-prefix", s.mgmt.PutForceModelPrefix)
+
+		// Virtual combo (named fallback-chain models). See internal/combo.
+		mgmt.GET("/combos", s.mgmt.GetCombos)
+		mgmt.POST("/combos", s.mgmt.PostCombo)
+		mgmt.GET("/combos/:name", s.mgmt.GetCombo)
+		mgmt.PUT("/combos/:name", s.mgmt.PutCombo)
+		mgmt.PATCH("/combos/:name", s.mgmt.PutCombo)
+		mgmt.DELETE("/combos/:name", s.mgmt.DeleteCombo)
 
 		mgmt.GET("/routing/strategy", s.mgmt.GetRoutingStrategy)
 		mgmt.PUT("/routing/strategy", s.mgmt.PutRoutingStrategy)

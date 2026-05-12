@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/combo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -46,6 +47,8 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	comboRegistry       *combo.Registry
+	comboStore          *combo.FileStore
 }
 
 // NewHandler creates a new management handler instance.
@@ -119,6 +122,30 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 	h.mu.Lock()
 	h.authManager = manager
 	h.mu.Unlock()
+}
+
+// SetComboRegistry wires the virtual combo registry and its persistent store
+// into the management handler. It is safe to call before or after the first
+// request — read paths Null-check the registry.
+func (h *Handler) SetComboRegistry(r *combo.Registry, store *combo.FileStore) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.comboRegistry = r
+	h.comboStore = store
+	h.mu.Unlock()
+}
+
+// ComboRegistry returns the registry installed via SetComboRegistry, or nil
+// when combos are disabled.
+func (h *Handler) ComboRegistry() *combo.Registry {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.comboRegistry
 }
 
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
