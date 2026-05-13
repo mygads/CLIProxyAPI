@@ -29,6 +29,13 @@ const (
 	// request still falls through on error, but successive requests start at
 	// different anchor points so load spreads across providers.
 	StrategyRoundRobin Strategy = "round-robin"
+
+	// StrategyAuto picks the best entry dynamically per request using
+	// the 9-factor scoring engine in internal/resilience. Combines
+	// breaker health, latency, quota, cost and other signals. When no
+	// scorer is wired, StrategyAuto falls back to StrategyFallback.
+	// See PRD v2 Phase 3D.
+	StrategyAuto Strategy = "auto"
 )
 
 // Status indicates whether a combo is published, in draft, or disabled.
@@ -88,7 +95,7 @@ func (c *Combo) Validate() error {
 	switch c.Strategy {
 	case "":
 		c.Strategy = StrategyFallback
-	case StrategyFallback, StrategyRoundRobin:
+	case StrategyFallback, StrategyRoundRobin, StrategyAuto:
 	default:
 		return fmt.Errorf("combo %q has unknown strategy %q", name, c.Strategy)
 	}
@@ -138,15 +145,65 @@ type Registry struct {
 	entries   map[string]*Combo
 	rrCursors map[string]int // round-robin cursor per combo name
 	rrUsed    map[string]int // sticky counter per combo name
+
+	// metrics tracks per-entry outcomes so operators can see which combo
+	// candidates actually succeed and which drag down p95. Nil-safe —
+	// callers that don't install a registry get no-op recording.
+	metrics *MetricsRegistry
+
+	// scorer is an optional pluggable scorer used by StrategyAuto. The
+	// input is an entry's model string; the return is a score in [0..1]
+	// (higher = better). When nil, StrategyAuto degrades to
+	// StrategyFallback behaviour. Set via SetScorer from the host (the
+	// scheduler wires a function that consults resilience.Manager +
+	// LatencyTracker + Quota state).
+	scorer func(model string) float64
 }
 
-// NewRegistry returns an empty in-memory registry.
+// NewRegistry returns an empty in-memory registry with a fresh metrics
+// sink. Callers that need to share metrics across registries can call
+// SetMetrics afterwards.
 func NewRegistry() *Registry {
 	return &Registry{
 		entries:   make(map[string]*Combo),
 		rrCursors: make(map[string]int),
 		rrUsed:    make(map[string]int),
+		metrics:   NewMetricsRegistry(),
 	}
+}
+
+// Metrics returns the per-entry metrics sink. Never nil after
+// NewRegistry. Callers use it to record samples when falling through a
+// combo chain (see management combo metrics endpoint).
+func (r *Registry) Metrics() *MetricsRegistry {
+	if r == nil {
+		return nil
+	}
+	return r.metrics
+}
+
+// SetMetrics replaces the registry's metrics sink. Used when multiple
+// registries share a single metrics store, or in tests.
+func (r *Registry) SetMetrics(m *MetricsRegistry) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.metrics = m
+	r.mu.Unlock()
+}
+
+// SetScorer installs an external scorer used by StrategyAuto. The
+// function is called for each candidate model string; return a score
+// in [0..1] (higher = better). Pass nil to disable auto scoring —
+// StrategyAuto then degrades to StrategyFallback behaviour.
+func (r *Registry) SetScorer(fn func(model string) float64) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.scorer = fn
+	r.mu.Unlock()
 }
 
 // Upsert inserts or replaces a combo. The caller must hold no other lock.
@@ -259,6 +316,17 @@ func (r *Registry) FirstCandidate(name string) string {
 	return candidates[0].Model
 }
 
+// AllCandidates returns the full ordered fallback list for a combo using the
+// internal Candidate type. Returns nil, false when the combo is unknown or
+// disabled. The slice is a copy — safe to hold across registry mutations.
+//
+// This is used by the server-side adapter (internal/api/server.go) that
+// bridges *Registry to the sdk/api/handlers.ComboResolver interface without
+// creating an import cycle.
+func (r *Registry) AllCandidates(name string) ([]Candidate, bool) {
+	return r.Resolve(name)
+}
+
 func sortStrings(s []string) {
 	for i := 1; i < len(s); i++ {
 		for j := i; j > 0 && s[j-1] > s[j]; j-- {
@@ -307,6 +375,26 @@ func (r *Registry) Resolve(name string) ([]Candidate, bool) {
 		r.rrCursors[key] = cursor
 		r.rrUsed[key] = used + 1
 		ordered = rotateEntries(ordered, cursor)
+	}
+
+	// Auto strategy: re-order entries by external scorer, highest first.
+	// When no scorer is installed, fall through to fallback ordering
+	// (which is what `ordered` already is). Stable sort so ties break
+	// by configured priority.
+	if combo.Strategy == StrategyAuto && r.scorer != nil && len(ordered) > 1 {
+		scorer := r.scorer
+		scores := make([]float64, len(ordered))
+		for i, e := range ordered {
+			scores[i] = scorer(e.Model)
+		}
+		// Insertion sort — len <= ~10 entries, simpler than sort.Slice
+		// and avoids the closure capture overhead.
+		for i := 1; i < len(ordered); i++ {
+			for j := i; j > 0 && scores[j] > scores[j-1]; j-- {
+				ordered[j], ordered[j-1] = ordered[j-1], ordered[j]
+				scores[j], scores[j-1] = scores[j-1], scores[j]
+			}
+		}
 	}
 
 	candidates := make([]Candidate, len(ordered))

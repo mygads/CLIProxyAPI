@@ -227,6 +227,27 @@ func NormalizeOAuthProvider(provider string) (string, error) {
 		return "gemini", nil
 	case "antigravity", "anti-gravity":
 		return "antigravity", nil
+	case "github", "copilot", "github-copilot":
+		return "github", nil
+	case "kiro":
+		return "kiro", nil
+	case "qwen", "qwen-code":
+		return "qwen", nil
+	case "cline":
+		return "cline", nil
+	case "kilocode", "kilo", "kilo-code":
+		return "kilocode", nil
+	case "qoder", "iflow", "qoder-iflow":
+		// 9router historically used "iflow" as the key; OmniRoute renamed
+		// it to "qoder" with alias "if". We accept both so existing
+		// 9router credentials migrating to CLIProxyAPI keep working.
+		return "qoder", nil
+	case "cursor":
+		// Cursor uses an import-token flow — operator pastes an access
+		// token from their IDE rather than going through a browser
+		// OAuth handshake. NormalizeOAuthProvider still accepts the key
+		// so the generic loader wires the credential correctly.
+		return "cursor", nil
 	default:
 		return "", errUnsupportedOAuthFlow
 	}

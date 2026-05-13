@@ -125,8 +125,64 @@ func (h *Handler) DeleteCombo(c *gin.Context) {
 	}
 	name := c.Param("name")
 	r.Delete(name)
+	// Drop metrics too so memory doesn't stay pinned by a dead combo.
+	if m := r.Metrics(); m != nil {
+		m.Reset(name)
+	}
 	h.persistCombos()
 	c.Status(http.StatusNoContent)
+}
+
+// GetComboMetrics returns per-entry rolling-window metrics for the
+// combo: success rate, latency p50/p95/p99, trigger-reason distribution.
+// The window is one hour by default (see combo.RetentionWindow).
+func (h *Handler) GetComboMetrics(c *gin.Context) {
+	r := h.ComboRegistry()
+	if r == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "combo registry not initialised"})
+		return
+	}
+	name := strings.TrimSpace(c.Param("name"))
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "combo name required"})
+		return
+	}
+	if !r.Has(name) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "combo not found"})
+		return
+	}
+	metrics := r.Metrics()
+	if metrics == nil {
+		c.JSON(http.StatusOK, gin.H{"combo": name, "entries": []any{}})
+		return
+	}
+	snaps := metrics.SnapshotAll(name)
+	out := make([]map[string]any, 0, len(snaps))
+	for _, s := range snaps {
+		entry := map[string]any{
+			"entry_index":      s.EntryIndex,
+			"total_requests":   s.TotalRequests,
+			"success_count":    s.SuccessCount,
+			"failure_count":    s.FailureCount,
+			"success_rate":     s.SuccessRate,
+			"latency_p50_sec":  s.LatencyP50Sec,
+			"latency_p95_sec":  s.LatencyP95Sec,
+			"latency_p99_sec":  s.LatencyP99Sec,
+			"trigger_reasons":  s.TriggerReasons,
+		}
+		if !s.OldestSample.IsZero() {
+			entry["oldest_sample"] = s.OldestSample.UTC().Format("2006-01-02T15:04:05Z07:00")
+		}
+		if !s.NewestSample.IsZero() {
+			entry["newest_sample"] = s.NewestSample.UTC().Format("2006-01-02T15:04:05Z07:00")
+		}
+		out = append(out, entry)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"combo":   name,
+		"entries": out,
+		"window":  combo.RetentionWindow.String(),
+	})
 }
 
 // persistCombos writes the in-memory registry to disk. Errors are logged

@@ -303,6 +303,24 @@ type ComboResolver interface {
 	// FirstCandidate returns the head of the fallback chain for name. Empty
 	// string means "not a combo, pass through".
 	FirstCandidate(name string) string
+	// Candidates returns the full ordered fallback list for a combo. The
+	// second return is the original combo name (for logging) — an empty
+	// slice + false means the name is not a combo. Callers iterate this
+	// list, stopping on the first success or at the last entry.
+	Candidates(name string) ([]ComboCandidate, bool)
+}
+
+// ComboCandidate is one step in a fallback chain returned by
+// ComboResolver.Candidates.
+type ComboCandidate struct {
+	// Model is the prefixed upstream identifier to try (e.g. "cc/claude-opus-4-7").
+	Model string
+	// TriggerOn lists response-body substrings that should cause a fall
+	// through to the next entry. Empty = "any retriable status triggers".
+	TriggerOn []string
+	// IsLast is true when this is the final entry in the chain. Callers
+	// should surface upstream errors as-is on this entry.
+	IsLast bool
 }
 
 // BaseAPIHandler contains the handlers for API endpoints.
@@ -551,6 +569,33 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	// Multi-candidate combo fallback. If the requested model is a combo,
+	// resolve the full chain and iterate until one entry succeeds or the
+	// list is exhausted. For single-model requests this collapses to the
+	// same single-call behaviour the code had before combos existed.
+	for _, attempt := range h.resolveModelAttempts(modelName) {
+		resp, headers, errMsg := h.executeSingle(ctx, handlerType, attempt.Model, rawJSON, alt)
+		if errMsg == nil {
+			return resp, headers, nil
+		}
+		if attempt.IsLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
+			return nil, nil, errMsg
+		}
+		// Otherwise loop to the next candidate.
+	}
+	// resolveModelAttempts always returns at least one entry (the original
+	// model), so we never reach here; keep the fall-through to satisfy the
+	// type checker.
+	return nil, nil, &interfaces.ErrorMessage{
+		StatusCode: http.StatusInternalServerError,
+		Error:      fmt.Errorf("combo fallback: no candidates produced for %q", modelName),
+	}
+}
+
+// executeSingle issues one non-streaming call using the canonical path that
+// existed before combos. It is split out so ExecuteWithAuthManager can loop
+// over combo candidates without duplicating the whole body.
+func (h *BaseAPIHandler) executeSingle(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
@@ -861,6 +906,73 @@ func statusFromError(err error) int {
 		}
 	}
 	return 0
+}
+
+// modelAttempt is one step in a combo fallback chain as seen by the
+// Execute* methods. For non-combo requests the slice has exactly one entry
+// with IsLast=true and empty TriggerOn.
+type modelAttempt struct {
+	Model     string
+	TriggerOn []string
+	IsLast    bool
+}
+
+// resolveModelAttempts returns the ordered list of models to try for a
+// request. For a combo name it returns all candidates from the registry;
+// for a plain prefixed model it returns a single-element slice.
+func (h *BaseAPIHandler) resolveModelAttempts(modelName string) []modelAttempt {
+	if h == nil || h.Combos == nil {
+		return []modelAttempt{{Model: modelName, IsLast: true}}
+	}
+	base := strings.TrimSpace(modelName)
+	// Combos cannot contain "/" — a slash means it is already a prefixed model.
+	if strings.Contains(base, "/") {
+		return []modelAttempt{{Model: modelName, IsLast: true}}
+	}
+	candidates, ok := h.Combos.Candidates(base)
+	if !ok || len(candidates) == 0 {
+		return []modelAttempt{{Model: modelName, IsLast: true}}
+	}
+	out := make([]modelAttempt, len(candidates))
+	for i, c := range candidates {
+		out[i] = modelAttempt{
+			Model:     c.Model,
+			TriggerOn: c.TriggerOn,
+			IsLast:    c.IsLast,
+		}
+	}
+	return out
+}
+
+// comboShouldFallback reports whether an error from one combo candidate
+// should cause the loop to try the next entry. It mirrors the logic in
+// internal/combo.ShouldFallback but operates on the handler-layer error
+// type so the SDK package stays free of internal imports.
+func comboShouldFallback(errMsg *interfaces.ErrorMessage, triggers []string) bool {
+	if errMsg == nil {
+		return false
+	}
+	status := errMsg.StatusCode
+	switch status {
+	case 429, 500, 502, 503, 504:
+		// Retriable status — check trigger keywords if any.
+	default:
+		return false
+	}
+	if len(triggers) == 0 {
+		return true
+	}
+	body := ""
+	if errMsg.Error != nil {
+		body = strings.ToLower(errMsg.Error.Error())
+	}
+	for _, t := range triggers {
+		needle := strings.ToLower(strings.TrimSpace(t))
+		if needle != "" && strings.Contains(body, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {

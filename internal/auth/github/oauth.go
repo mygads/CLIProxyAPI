@@ -16,19 +16,35 @@ import (
 // point at their own OAuth app.
 //
 // Reference: github.com/microsoft/vscode-copilot-release (Client IDs table).
+// Header values mirror OmniRoute's providerHeaderProfiles.ts as of 2026-05.
 const (
 	DefaultClientID        = "Iv1.b507a08c87ecfe98"
 	DeviceCodeURL          = "https://github.com/login/device/code"
 	DeviceTokenURL         = "https://github.com/login/oauth/access_token"
 	DefaultScope           = "read:user"
 	DeviceGrantType        = "urn:ietf:params:oauth:grant-type:device_code"
+	RefreshGrantType       = "refresh_token"
 	CopilotTokenExchangeURL = "https://api.github.com/copilot_internal/v2/token"
 	UserInfoURL             = "https://api.github.com/user"
 
-	// UserAgent mimics the upstream Copilot CLI so GitHub does not gate us.
-	// Bumping this string is cheap — if GitHub rejects future requests, the
-	// first thing to try is matching the current VS Code Copilot UA.
-	UserAgent = "GitHubCopilotChat/0.26.0"
+	// APIVersion is the X-Github-Api-Version header Copilot clients send.
+	APIVersion = "2025-04-01"
+
+	// Editor fingerprint headers. Updating in lockstep with the upstream
+	// VS Code Copilot extension reduces the chance GitHub gates us on a
+	// header mismatch. These values match OmniRoute 2026-05.
+	EditorVersion            = "vscode/1.117.0"
+	ChatPluginVersion        = "copilot-chat/0.45.1"
+	RefreshPluginVersion     = "copilot/1.388.0"
+	UserAgentLibraryVersion  = "electron-fetch"
+	IntegrationID            = "vscode-chat"
+	OpenAIIntent             = "conversation-panel"
+	DefaultInitiator         = "user"
+
+	// UserAgent used for chat completions. For the /copilot_internal/v2/token
+	// exchange, use RefreshUserAgent instead.
+	UserAgent        = "GitHubCopilotChat/0.45.1"
+	RefreshUserAgent = "GithubCopilot/1.0"
 )
 
 // DeviceCode is the response from POST /login/device/code. The fields
@@ -210,8 +226,9 @@ func pollOnce(ctx context.Context, clientID, deviceCode string) (token string, b
 }
 
 // ExchangeCopilotToken trades a long-lived GitHub access token for a
-// short-lived Copilot bearer token. The Copilot API expects this exact
-// UA + auth header combination.
+// short-lived Copilot bearer token. The Copilot internal endpoint matches
+// on the refresh-style UA/Editor-Version headers OmniRoute uses — not the
+// chat-completions ones — so they are distinct constants in this file.
 func ExchangeCopilotToken(ctx context.Context, githubAccessToken string) (*CopilotTokenResponse, error) {
 	if strings.TrimSpace(githubAccessToken) == "" {
 		return nil, fmt.Errorf("github copilot: empty github access token")
@@ -220,13 +237,13 @@ func ExchangeCopilotToken(ctx context.Context, githubAccessToken string) (*Copil
 	if err != nil {
 		return nil, fmt.Errorf("github copilot: build request: %w", err)
 	}
-	// GitHub OAuth tokens use the `token` auth scheme, not `Bearer`, on the
-	// REST API. The Copilot endpoint enforces this.
+	// GitHub OAuth tokens use the `token` auth scheme (not `Bearer`) on
+	// the REST API. The Copilot internal endpoint enforces this.
 	req.Header.Set("Authorization", "token "+githubAccessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", UserAgent)
-	req.Header.Set("Editor-Version", "vscode/1.99.0")
-	req.Header.Set("Editor-Plugin-Version", "copilot-chat/0.26.0")
+	req.Header.Set("User-Agent", RefreshUserAgent)
+	req.Header.Set("Editor-Version", EditorVersion)
+	req.Header.Set("Editor-Plugin-Version", RefreshPluginVersion)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -244,6 +261,74 @@ func ExchangeCopilotToken(ctx context.Context, githubAccessToken string) (*Copil
 		return nil, fmt.Errorf("github copilot: empty token in exchange response")
 	}
 	return &out, nil
+}
+
+// RefreshTokenResponse is the shape of POST /login/oauth/access_token when
+// grant_type=refresh_token.
+type RefreshTokenResponse struct {
+	AccessToken      string `json:"access_token,omitempty"`
+	RefreshToken     string `json:"refresh_token,omitempty"`
+	ExpiresIn        int    `json:"expires_in,omitempty"`
+	TokenType        string `json:"token_type,omitempty"`
+	Scope            string `json:"scope,omitempty"`
+	Error            string `json:"error,omitempty"`
+	ErrorDescription string `json:"error_description,omitempty"`
+}
+
+// RefreshGitHubToken exchanges a refresh_token for a fresh GitHub access
+// token. This is the "Layer 2" fallback OmniRoute uses when the Copilot
+// token exchange fails: if the GitHub access token itself has expired, we
+// need to mint a new one before we can re-exchange for a Copilot token.
+//
+// GitHub OAuth apps issued after 2022 support refresh tokens with a
+// client_secret. Classic OAuth apps without refresh tokens should skip
+// this call — the higher layer checks for a non-empty refresh_token
+// before invoking RefreshGitHubToken.
+func RefreshGitHubToken(ctx context.Context, clientID, clientSecret, refreshToken string) (*RefreshTokenResponse, error) {
+	if strings.TrimSpace(clientID) == "" {
+		clientID = DefaultClientID
+	}
+	if strings.TrimSpace(refreshToken) == "" {
+		return nil, fmt.Errorf("github refresh: empty refresh_token")
+	}
+
+	form := url.Values{}
+	form.Set("client_id", clientID)
+	form.Set("grant_type", RefreshGrantType)
+	form.Set("refresh_token", refreshToken)
+	if strings.TrimSpace(clientSecret) != "" {
+		form.Set("client_secret", clientSecret)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", DeviceTokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("github refresh: build request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", UserAgent)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("github refresh: do: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var tr RefreshTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
+		return nil, fmt.Errorf("github refresh: decode: %w", err)
+	}
+	if tr.Error != "" {
+		desc := tr.ErrorDescription
+		if desc == "" {
+			desc = tr.Error
+		}
+		return nil, fmt.Errorf("github refresh: %s: %s", tr.Error, desc)
+	}
+	if tr.AccessToken == "" {
+		return nil, fmt.Errorf("github refresh: empty access_token (status %d)", resp.StatusCode)
+	}
+	return &tr, nil
 }
 
 // FetchLogin returns the GitHub login (username) for the given access

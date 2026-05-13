@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/resilience"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -176,6 +177,21 @@ type Manager struct {
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
 
+	// breakers is the per-credential circuit-breaker manager. Nil is
+	// tolerated (breakers are skipped in that case) so existing tests
+	// and embedders that don't care about resilience still compile.
+	breakers *resilience.Manager
+
+	// latency tracks per-credential p50/p95/p99 and success rate so
+	// the auto-combo scorer has real numbers to work with. Nil-safe.
+	latency map[string]*resilience.LatencyTracker
+	latMu   sync.RWMutex
+
+	// selfHealing holds progressive-backoff exclusions per credential.
+	// Populated by MarkResult when scoring indicates a credential
+	// should be evicted for a while.
+	selfHealing *resilience.SelfHealing
+
 	// Auto refresh state
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
@@ -197,11 +213,23 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		auths:            make(map[string]*Auth),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
+		breakers:         resilience.NewDefaultManager(),
+		latency:          make(map[string]*resilience.LatencyTracker),
+		selfHealing:      resilience.NewDefaultSelfHealing(),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
+	// Wire breaker gate so scheduler skips OPEN credentials. The gate
+	// closure captures manager.breakers, not a direct reference to the
+	// resilience package, keeping the scheduler package import-clean.
+	manager.scheduler.breakerGate = func(authID, authKind string) bool {
+		if manager.breakers == nil {
+			return true
+		}
+		return manager.breakers.Allow(authID, authKind)
+	}
 	return manager
 }
 
@@ -2283,7 +2311,212 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
 	}
 
+	// Circuit breaker accounting. Report every result so tripped
+	// credentials transition to OPEN after repeated failures, and
+	// recover via HALF_OPEN probes once they start succeeding again.
+	// 401s are treated as failures here because they usually mean the
+	// refresh step was unable to recover the credential — which is a
+	// provider-health signal, not a client error.
+	if m.breakers != nil && result.AuthID != "" {
+		authKind := "oauth"
+		if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+			kind, _ := auth.AccountInfo()
+			if strings.EqualFold(strings.TrimSpace(kind), "api_key") {
+				authKind = "api_key"
+			}
+		}
+		if result.Success {
+			m.breakers.RecordSuccess(result.AuthID, authKind)
+		} else {
+			m.breakers.RecordFailure(result.AuthID, authKind)
+		}
+	}
+
+	// Record the outcome on the per-credential latency tracker so the
+	// auto-combo scorer can factor p95 latency + success rate. Latency
+	// is unknown here (the Result struct doesn't carry it yet) so pass
+	// zero — future wiring should populate it from the execution path.
+	// Even without latency, the success/failure signal feeds the
+	// stability factor which is enough to rank degraded credentials.
+	if result.AuthID != "" {
+		if lt := m.latencyFor(result.AuthID); lt != nil {
+			lt.Record(0, result.Success)
+		}
+	}
+
+	// Self-healing: on sustained failure, exclude the credential with
+	// progressive backoff. We rely on the breaker's consecutive-fail
+	// counter as the signal — when the breaker trips (state == OPEN),
+	// add an exclusion at the next ladder rung.
+	if !result.Success && m.selfHealing != nil && m.breakers != nil && result.AuthID != "" {
+		if b := m.breakers.Get(result.AuthID, ""); b != nil && b.State() == resilience.StateOpen {
+			reason := "breaker tripped"
+			if result.Error != nil && result.Error.Message != "" {
+				reason = result.Error.Message
+			}
+			m.selfHealing.Exclude(result.AuthID, reason)
+		}
+	}
+
 	m.hook.OnResult(ctx, result)
+}
+
+// Breakers returns the circuit-breaker manager for snapshot queries and
+// manual overrides from the management UI. May be nil when the manager
+// was constructed via a path that does not wire breakers.
+func (m *Manager) Breakers() *resilience.Manager {
+	if m == nil {
+		return nil
+	}
+	return m.breakers
+}
+
+// SelfHealing returns the self-healing exclusion manager. Nil-safe in
+// the same spirit as Breakers().
+func (m *Manager) SelfHealing() *resilience.SelfHealing {
+	if m == nil {
+		return nil
+	}
+	return m.selfHealing
+}
+
+// latencyFor returns or creates the LatencyTracker for the given auth ID.
+// Thread-safe.
+func (m *Manager) latencyFor(authID string) *resilience.LatencyTracker {
+	if m == nil || authID == "" {
+		return nil
+	}
+	m.latMu.RLock()
+	lt, ok := m.latency[authID]
+	m.latMu.RUnlock()
+	if ok {
+		return lt
+	}
+	m.latMu.Lock()
+	defer m.latMu.Unlock()
+	if lt, ok = m.latency[authID]; ok {
+		return lt
+	}
+	lt = resilience.NewLatencyTracker()
+	m.latency[authID] = lt
+	return lt
+}
+
+// LatencySnapshot returns the per-auth latency stats. Used by the
+// scoring path and by management UI health views.
+func (m *Manager) LatencySnapshot(authID string) resilience.Stats {
+	if m == nil {
+		return resilience.Stats{}
+	}
+	return m.latencyFor(authID).Snapshot()
+}
+
+// ScoreForAuth computes a combined [0..1] score for the given credential
+// drawn from breaker health + latency p95 + success rate. Returns 1.0
+// (optimistic) when the credential has no observations yet so new
+// credentials get a chance to compete. Used by the auto-combo strategy.
+func (m *Manager) ScoreForAuth(authID string) float64 {
+	if m == nil || authID == "" {
+		return 1.0
+	}
+	factors := resilience.Factors{
+		Quota:            1.0,
+		Health:           1.0,
+		CostInv:          0.5,
+		LatencyInv:       1.0,
+		TaskFit:          1.0,
+		Stability:        1.0,
+		TierPriority:     0.5,
+		TierAffinity:     1.0,
+		SpecificityMatch: 1.0,
+	}
+	if m.breakers != nil {
+		if b := m.breakers.Get(authID, ""); b != nil {
+			factors.Health = resilience.HealthFromState(b.State())
+		}
+	}
+	if stats := m.LatencySnapshot(authID); stats.SampleCount > 0 {
+		factors.LatencyInv = resilience.LatencyInvFromP95(stats.P95Sec)
+		// Use success rate as the stability proxy — credentials that
+		// sometimes fail deserve less weight even when healthy.
+		factors.Stability = stats.SuccessRate
+	}
+	return resilience.Score(factors, nil)
+}
+
+// ScoreForModel resolves a "prefix/model" string to the best available
+// credential for that prefix and returns its score. When no credential
+// is available (all blocked, prefix unknown, etc.), returns 0 so combo
+// auto-strategy deprioritizes the entry. Public so the combo registry
+// scorer hook can call into it.
+func (m *Manager) ScoreForModel(model string) float64 {
+	if m == nil || model == "" {
+		return 0
+	}
+	prefix, _, ok := splitPrefixModel(model)
+	if !ok {
+		return 0
+	}
+	// Look for the highest-scoring auth with the matching prefix that
+	// is currently allowed by the breaker. Reuse GetAuth's lock pattern
+	// — read m.auths under RLock, copy IDs out, score after release.
+	m.mu.RLock()
+	candidates := make([]string, 0, len(m.auths))
+	for id, a := range m.auths {
+		if a == nil {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(a.Prefix), prefix) {
+			continue
+		}
+		candidates = append(candidates, id)
+	}
+	m.mu.RUnlock()
+
+	if len(candidates) == 0 {
+		return 0
+	}
+	best := 0.0
+	for _, id := range candidates {
+		// Skip excluded credentials.
+		if m.selfHealing != nil {
+			if excluded, _ := m.selfHealing.Check(id); excluded {
+				continue
+			}
+		}
+		s := m.ScoreForAuth(id)
+		if s > best {
+			best = s
+		}
+	}
+	return best
+}
+
+// splitPrefixModel splits "prefix/model" into ("prefix", "model", true).
+// Returns ok=false when the input has no slash.
+func splitPrefixModel(s string) (string, string, bool) {
+	idx := strings.Index(s, "/")
+	if idx <= 0 || idx == len(s)-1 {
+		return "", "", false
+	}
+	return s[:idx], s[idx+1:], true
+}
+
+// GetAuth returns a snapshot of the auth record for the given ID. The
+// second return value is false when the ID is not known. Management
+// endpoints use this to cross-reference breaker snapshots with human-
+// readable labels.
+func (m *Manager) GetAuth(id string) (*Auth, bool) {
+	if m == nil || id == "" {
+		return nil, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	auth, ok := m.auths[id]
+	if !ok || auth == nil {
+		return nil, false
+	}
+	return auth.Clone(), true
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {

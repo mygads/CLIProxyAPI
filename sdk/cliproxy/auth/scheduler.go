@@ -37,6 +37,12 @@ type authScheduler struct {
 	providers     map[string]*providerScheduler
 	authProviders map[string]string
 	mixedCursors  map[string]int
+
+	// breakerGate, when non-nil, is consulted for each candidate during
+	// picking. Returning false means the breaker is OPEN and the
+	// candidate should be skipped. Wired from conductor.Manager so the
+	// scheduler stays testable without importing resilience directly.
+	breakerGate func(authID, authKind string) bool
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -268,6 +274,15 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 				return false
 			}
 		}
+		// Circuit-breaker gate: skip credentials whose breaker is OPEN.
+		// The gate is optional (nil = allow all) so tests and older
+		// embedders that don't wire resilience still work.
+		if s.breakerGate != nil {
+			kind, _ := entry.auth.AccountInfo()
+			if !s.breakerGate(entry.auth.ID, kind) {
+				return false
+			}
+		}
 		return true
 	}
 	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate); picked != nil {
@@ -313,7 +328,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
 		shard := providerState.ensureModelLocked(modelKey, time.Now())
-		predicate := func(entry *scheduledAuth) bool {
+		predicate := s.withBreakerGate(func(entry *scheduledAuth) bool {
 			if entry == nil || entry.auth == nil || entry.auth.ID != pinnedAuthID {
 				return false
 			}
@@ -322,14 +337,14 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			}
 			_, ok := tried[pinnedAuthID]
 			return !ok
-		}
+		})
 		if picked := shard.pickReadyLocked(false, s.strategy, predicate); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
 	}
 
-	predicate := triedPredicate(tried)
+	predicate := s.withBreakerGate(triedPredicate(tried))
 	candidateShards := make([]*modelScheduler, len(normalized))
 	bestPriority := 0
 	hasCandidate := false
@@ -473,6 +488,26 @@ func triedPredicate(tried map[string]struct{}) func(*scheduledAuth) bool {
 		}
 		_, ok := tried[entry.auth.ID]
 		return !ok
+	}
+}
+
+// withBreakerGate wraps an inner predicate so candidates whose breaker
+// is OPEN are skipped. If s.breakerGate is nil the inner predicate is
+// returned unchanged — no-op for tests/embedders that don't wire one.
+func (s *authScheduler) withBreakerGate(inner func(*scheduledAuth) bool) func(*scheduledAuth) bool {
+	if s == nil || s.breakerGate == nil {
+		return inner
+	}
+	gate := s.breakerGate
+	return func(entry *scheduledAuth) bool {
+		if entry == nil || entry.auth == nil {
+			return false
+		}
+		if inner != nil && !inner(entry) {
+			return false
+		}
+		kind, _ := entry.auth.AccountInfo()
+		return gate(entry.auth.ID, kind)
 	}
 }
 

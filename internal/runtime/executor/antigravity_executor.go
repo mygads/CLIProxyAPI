@@ -2097,7 +2097,7 @@ func buildBaseURL(auth *cliproxyauth.Auth) string {
 	if baseURLs := antigravityBaseURLFallbackOrder(auth); len(baseURLs) > 0 {
 		return baseURLs[0]
 	}
-	return antigravityBaseURLDaily
+	return antigravityBaseURLProd
 }
 
 func resolveHost(base string) string {
@@ -2296,9 +2296,14 @@ var antigravityBaseURLFallbackOrder = func(auth *cliproxyauth.Auth) []string {
 	if base := resolveCustomAntigravityBaseURL(auth); base != "" {
 		return []string{base}
 	}
+	// Order matters: prod is tried first because it is the stable tier.
+	// Daily is kept as a retry target for regions where prod is
+	// temporarily degraded — swapping this order was the source of an
+	// earlier outage where prod-only credentials silently failed on
+	// daily's 503 before reaching prod.
 	return []string{
-		antigravityBaseURLDaily,
 		antigravityBaseURLProd,
+		antigravityBaseURLDaily,
 		// antigravitySandboxBaseURLDaily,
 	}
 }

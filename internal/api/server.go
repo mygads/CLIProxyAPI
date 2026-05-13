@@ -127,6 +127,47 @@ func WithPostAuthHook(hook auth.PostAuthHook) ServerOption {
 	}
 }
 
+// comboResolverAdapter bridges *combo.Registry to the
+// sdk/api/handlers.ComboResolver interface without creating an import cycle.
+// The internal/combo package cannot import sdk/api/handlers, so we define
+// the adapter here in the internal/api layer which can see both.
+type comboResolverAdapter struct {
+	reg *combo.Registry
+}
+
+func (a *comboResolverAdapter) Has(name string) bool {
+	if a == nil || a.reg == nil {
+		return false
+	}
+	return a.reg.Has(name)
+}
+
+func (a *comboResolverAdapter) FirstCandidate(name string) string {
+	if a == nil || a.reg == nil {
+		return ""
+	}
+	return a.reg.FirstCandidate(name)
+}
+
+func (a *comboResolverAdapter) Candidates(name string) ([]handlers.ComboCandidate, bool) {
+	if a == nil || a.reg == nil {
+		return nil, false
+	}
+	raw, ok := a.reg.AllCandidates(name)
+	if !ok {
+		return nil, false
+	}
+	out := make([]handlers.ComboCandidate, len(raw))
+	for i, c := range raw {
+		out[i] = handlers.ComboCandidate{
+			Model:     c.Model,
+			TriggerOn: append([]string(nil), c.TriggerOn...),
+			IsLast:    c.IsLast,
+		}
+	}
+	return out, true
+}
+
 // Server represents the main API server.
 // It encapsulates the Gin engine, HTTP server, handlers, and configuration.
 type Server struct {
@@ -311,11 +352,25 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		s.combos = comboReg
 		s.comboStore = comboStore
 		s.mgmt.SetComboRegistry(comboReg, comboStore)
+
+		// Wire the auto-combo scorer so StrategyAuto has real signals
+		// to rank by. The scorer takes a prefix/model string and
+		// returns the composite score of the best-matching credential
+		// — breaker health + latency + success rate. When no auth
+		// manager is available, the default 1.0 keeps StrategyAuto
+		// degrading cleanly to StrategyFallback ordering.
+		if s.handlers != nil && s.handlers.AuthManager != nil {
+			mgr := s.handlers.AuthManager
+			comboReg.SetScorer(mgr.ScoreForModel)
+		}
+
 		// Expose the registry to the request path so combo names in
 		// `model` fields are rewritten to their first candidate before
-		// the provider lookup runs.
+		// the provider lookup runs. We wrap the registry in an adapter
+		// so the SDK handlers package sees the interface shape it
+		// expects without the internal/combo package leaking into it.
 		if s.handlers != nil {
-			s.handlers.Combos = comboReg
+			s.handlers.Combos = &comboResolverAdapter{reg: comboReg}
 		}
 	}
 
@@ -514,6 +569,79 @@ func (s *Server) setupRoutes() {
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
 	})
 
+	// GitHub Copilot OAuth callback. GitHub redirects here after the user
+	// approves the device-code flow. The code+state are persisted for the
+	// polling goroutine in the management handler.
+	s.engine.GET("/github/callback", func(c *gin.Context) {
+		code := c.Query("code")
+		state := c.Query("state")
+		errStr := c.Query("error")
+		if errStr == "" {
+			errStr = c.Query("error_description")
+		}
+		if state != "" {
+			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "github", state, code, errStr)
+		}
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusOK, oauthCallbackSuccessHTML)
+	})
+
+	// Kiro OAuth callback. Kiro redirects here after browser login.
+	// The refresh token is passed as a query parameter by the Kiro auth
+	// endpoint; we persist it the same way as other providers.
+	s.engine.GET("/kiro/callback", func(c *gin.Context) {
+		// Kiro passes the refresh token directly in the fragment/query.
+		// We treat it as the "code" for consistency with the pending-session
+		// file format used by all other providers.
+		code := c.Query("refresh_token")
+		if code == "" {
+			code = c.Query("code")
+		}
+		state := c.Query("state")
+		errStr := c.Query("error")
+		if state != "" {
+			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "kiro", state, code, errStr)
+		}
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusOK, oauthCallbackSuccessHTML)
+	})
+
+	// Qwen Code OAuth callback. Device-code flow polls for the token
+	// in the management handler, so this route is only used when an
+	// operator copies the verification URI complete by hand. The
+	// session-file mechanism keeps the rest of the pipeline uniform.
+	s.engine.GET("/qwen/callback", func(c *gin.Context) {
+		code := c.Query("code")
+		state := c.Query("state")
+		errStr := c.Query("error")
+		if state != "" {
+			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "qwen", state, code, errStr)
+		}
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusOK, oauthCallbackSuccessHTML)
+	})
+
+	// Cline Bot OAuth callback. Cline embeds the access + refresh
+	// tokens in a base64-encoded JSON blob inside the "code" parameter
+	// — the management handler decodes it, but we must persist it as
+	// the canonical "code" field so the existing pending-session
+	// mechanism applies uniformly.
+	s.engine.GET("/cline/callback", func(c *gin.Context) {
+		code := c.Query("code")
+		if code == "" {
+			// Cline can also drop the encoded payload into a dedicated
+			// "token" or "data" parameter on some integrations.
+			code = c.Query("token")
+		}
+		state := c.Query("state")
+		errStr := c.Query("error")
+		if state != "" {
+			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "cline", state, code, errStr)
+		}
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusOK, oauthCallbackSuccessHTML)
+	})
+
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
 }
 
@@ -673,6 +801,17 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/combos/:name", s.mgmt.PutCombo)
 		mgmt.PATCH("/combos/:name", s.mgmt.PutCombo)
 		mgmt.DELETE("/combos/:name", s.mgmt.DeleteCombo)
+		mgmt.GET("/combos/:name/metrics", s.mgmt.GetComboMetrics)
+
+		// Circuit breaker observability + manual overrides. The list
+		// endpoint always returns (possibly empty); the force endpoint
+		// 404s when the auth ID has no breaker yet.
+		mgmt.GET("/breakers", s.mgmt.ListBreakers)
+		mgmt.POST("/breakers/:auth_id/force", s.mgmt.ForceBreaker)
+
+		// Self-healing exclusions (auto-combo eviction tracking).
+		mgmt.GET("/exclusions", s.mgmt.ListExclusions)
+		mgmt.DELETE("/exclusions/:auth_id", s.mgmt.ClearExclusion)
 
 		mgmt.GET("/routing/strategy", s.mgmt.GetRoutingStrategy)
 		mgmt.PUT("/routing/strategy", s.mgmt.PutRoutingStrategy)
@@ -723,6 +862,11 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)
 		mgmt.GET("/antigravity-auth-url", s.mgmt.RequestAntigravityToken)
 		mgmt.GET("/kimi-auth-url", s.mgmt.RequestKimiToken)
+		mgmt.GET("/github-auth-url", s.mgmt.RequestGitHubToken)
+		mgmt.GET("/kiro-auth-url", s.mgmt.RequestKiroToken)
+		mgmt.GET("/qwen-auth-url", s.mgmt.RequestQwenToken)
+		mgmt.GET("/cline-auth-url", s.mgmt.RequestClineToken)
+		mgmt.GET("/kilocode-auth-url", s.mgmt.RequestKiloCodeToken)
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 	}
