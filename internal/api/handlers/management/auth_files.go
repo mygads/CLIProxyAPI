@@ -27,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
+	internalauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -1376,6 +1377,18 @@ func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
 func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
+	}
+	// Auto-fill prefix from the OAuth default registry when the caller did not
+	// set one explicitly. This ensures every persisted OAuth credential has a
+	// routing prefix out of the box (see docs/PRD-V3-PREFIX-LOADBALANCE.md §3.2).
+	if strings.TrimSpace(record.Prefix) == "" {
+		if defaultPrefix := internalauth.DefaultPrefixFor(record.Provider); defaultPrefix != "" {
+			record.Prefix = defaultPrefix
+			if record.Metadata == nil {
+				record.Metadata = make(map[string]any)
+			}
+			record.Metadata["prefix"] = defaultPrefix
+		}
 	}
 	store := h.tokenStoreWithBaseDir()
 	if store == nil {

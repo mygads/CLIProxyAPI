@@ -317,6 +317,22 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 	h.persist(c)
 }
 
+// LoadBalance (global toggle: true = round-robin, false = priority/fill-first)
+func (h *Handler) GetLoadBalance(c *gin.Context) {
+	c.JSON(200, gin.H{"load-balance": h.cfg.Routing.IsLoadBalanceEnabled()})
+}
+func (h *Handler) PutLoadBalance(c *gin.Context) {
+	var body struct {
+		Value *bool `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	h.cfg.Routing.LoadBalance = body.Value
+	h.persist(c)
+}
+
 // Proxy URL
 func (h *Handler) GetProxyURL(c *gin.Context) { c.JSON(200, gin.H{"proxy-url": h.cfg.ProxyURL}) }
 func (h *Handler) PutProxyURL(c *gin.Context) {

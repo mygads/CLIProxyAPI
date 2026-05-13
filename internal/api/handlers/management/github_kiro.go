@@ -240,6 +240,95 @@ func (h *Handler) RequestKiroToken(c *gin.Context) {
 	})
 }
 
+// ImportKiroToken validates a manually-provided Kiro refresh token and
+// saves it as a credential. This mirrors the "Import Token" flow in
+// 9router where the operator pastes a refresh token (starting with
+// "aorAAAAAG") directly instead of going through the browser OAuth flow.
+func (h *Handler) ImportKiroToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	var body struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	refreshToken := strings.TrimSpace(body.RefreshToken)
+	if refreshToken == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "refresh_token is required"})
+		return
+	}
+
+	if !strings.HasPrefix(refreshToken, "aorAAAAAG") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid token format — Kiro refresh tokens start with aorAAAAAG"})
+		return
+	}
+
+	refreshResp, err := kiroauth.Refresh(ctx, refreshToken)
+	if err != nil {
+		log.Errorf("kiro import token refresh failed: %v", err)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": fmt.Sprintf("token validation failed: %v", err)})
+		return
+	}
+
+	storedRefresh := refreshToken
+	if rotated := strings.TrimSpace(refreshResp.RefreshToken); rotated != "" {
+		storedRefresh = rotated
+	}
+
+	storage := &kiroauth.KiroTokenStorage{
+		AccessToken:  refreshResp.AccessToken,
+		RefreshToken: storedRefresh,
+		Expire:       refreshResp.ExpiresAt,
+		Region:       refreshResp.Region,
+		ProfileArn:   refreshResp.ProfileArn,
+		Email:        refreshResp.Email,
+		Type:         "kiro",
+		LastRefresh:  time.Now().UTC().Format(time.RFC3339),
+	}
+
+	metadata := map[string]any{
+		"type":          "kiro",
+		"access_token":  refreshResp.AccessToken,
+		"refresh_token": storedRefresh,
+		"expires_at":    refreshResp.ExpiresAt,
+		"region":        refreshResp.Region,
+		"email":         refreshResp.Email,
+		"timestamp":     time.Now().UnixMilli(),
+	}
+
+	label := "Kiro AI (imported)"
+	if refreshResp.Email != "" {
+		label = fmt.Sprintf("Kiro AI (%s)", refreshResp.Email)
+	}
+
+	fileName := fmt.Sprintf("kiro-%d.json", time.Now().UnixMilli())
+	record := &coreauth.Auth{
+		ID:       fileName,
+		Provider: "kiro",
+		FileName: fileName,
+		Label:    label,
+		Storage:  storage,
+		Metadata: metadata,
+	}
+	savedPath, errSave := h.saveTokenRecord(ctx, record)
+	if errSave != nil {
+		log.Errorf("save kiro imported token: %v", errSave)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist token"})
+		return
+	}
+	log.Infof("Kiro credential (imported) saved to %s", savedPath)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "ok",
+		"label":  label,
+		"email":  refreshResp.Email,
+	})
+}
+
 // waitForPendingOAuthCallback polls the auth directory for the callback
 // file written by WriteOAuthCallbackFileForPendingSession. The file is
 // removed as soon as it is read so a subsequent run with the same state

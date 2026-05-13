@@ -1005,7 +1005,8 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	// candidate here. Multi-candidate fallback in the execution loop is a
 	// follow-up change; this already covers the common case where the head
 	// entry succeeds, which is the whole point of combos in production.
-	if h != nil && h.Combos != nil && !strings.Contains(baseModel, "/") && h.Combos.Has(baseModel) {
+	// Combo registry is checked before splitting on "/" because combo names may contain slashes.
+	if h != nil && h.Combos != nil && h.Combos.Has(baseModel) {
 		if head := strings.TrimSpace(h.Combos.FirstCandidate(baseModel)); head != "" {
 			if parsed.HasSuffix {
 				resolvedModelName = fmt.Sprintf("%s(%s)", head, parsed.RawSuffix)

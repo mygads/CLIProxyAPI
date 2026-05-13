@@ -29,8 +29,8 @@ func TestDeleteGeminiKey_RequiresBaseURLWhenAPIKeyDuplicated(t *testing.T) {
 	h := &Handler{
 		cfg: &config.Config{
 			GeminiKey: []config.GeminiKey{
-				{APIKey: "shared-key", BaseURL: "https://a.example.com"},
-				{APIKey: "shared-key", BaseURL: "https://b.example.com"},
+				{APIKey: "shared-key", BaseURL: "https://a.example.com", Prefix: "gmn-a"},
+				{APIKey: "shared-key", BaseURL: "https://b.example.com", Prefix: "gmn-b"},
 			},
 		},
 		configFilePath: writeTestConfigFile(t),
@@ -57,8 +57,8 @@ func TestDeleteGeminiKey_DeletesOnlyMatchingBaseURL(t *testing.T) {
 	h := &Handler{
 		cfg: &config.Config{
 			GeminiKey: []config.GeminiKey{
-				{APIKey: "shared-key", BaseURL: "https://a.example.com"},
-				{APIKey: "shared-key", BaseURL: "https://b.example.com"},
+				{APIKey: "shared-key", BaseURL: "https://a.example.com", Prefix: "gmn-a"},
+				{APIKey: "shared-key", BaseURL: "https://b.example.com", Prefix: "gmn-b"},
 			},
 		},
 		configFilePath: writeTestConfigFile(t),
@@ -88,8 +88,8 @@ func TestDeleteClaudeKey_DeletesEmptyBaseURLWhenExplicitlyProvided(t *testing.T)
 	h := &Handler{
 		cfg: &config.Config{
 			ClaudeKey: []config.ClaudeKey{
-				{APIKey: "shared-key", BaseURL: ""},
-				{APIKey: "shared-key", BaseURL: "https://claude.example.com"},
+				{APIKey: "shared-key", BaseURL: "", Prefix: "cc-empty"},
+				{APIKey: "shared-key", BaseURL: "https://claude.example.com", Prefix: "cc-main"},
 			},
 		},
 		configFilePath: writeTestConfigFile(t),
@@ -119,8 +119,8 @@ func TestDeleteVertexCompatKey_DeletesOnlyMatchingBaseURL(t *testing.T) {
 	h := &Handler{
 		cfg: &config.Config{
 			VertexCompatAPIKey: []config.VertexCompatKey{
-				{APIKey: "shared-key", BaseURL: "https://a.example.com"},
-				{APIKey: "shared-key", BaseURL: "https://b.example.com"},
+				{APIKey: "shared-key", BaseURL: "https://a.example.com", Prefix: "vtx-a"},
+				{APIKey: "shared-key", BaseURL: "https://b.example.com", Prefix: "vtx-b"},
 			},
 		},
 		configFilePath: writeTestConfigFile(t),
@@ -150,8 +150,8 @@ func TestDeleteCodexKey_RequiresBaseURLWhenAPIKeyDuplicated(t *testing.T) {
 	h := &Handler{
 		cfg: &config.Config{
 			CodexKey: []config.CodexKey{
-				{APIKey: "shared-key", BaseURL: "https://a.example.com"},
-				{APIKey: "shared-key", BaseURL: "https://b.example.com"},
+				{APIKey: "shared-key", BaseURL: "https://a.example.com", Prefix: "cdx-a"},
+				{APIKey: "shared-key", BaseURL: "https://b.example.com", Prefix: "cdx-b"},
 			},
 		},
 		configFilePath: writeTestConfigFile(t),

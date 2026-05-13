@@ -18,24 +18,13 @@ import (
 )
 
 // Strategy governs how the resolver orders combo entries for a single request.
+// DEPRECATED: replaced by LoadBalance bool. Kept for storage migration only.
 type Strategy string
 
 const (
-	// StrategyFallback tries entries strictly in priority order. The second
-	// entry is only touched if the first one returns a retriable error.
-	StrategyFallback Strategy = "fallback"
-
-	// StrategyRoundRobin rotates through entries across requests. A single
-	// request still falls through on error, but successive requests start at
-	// different anchor points so load spreads across providers.
+	StrategyFallback   Strategy = "fallback"
 	StrategyRoundRobin Strategy = "round-robin"
-
-	// StrategyAuto picks the best entry dynamically per request using
-	// the 9-factor scoring engine in internal/resilience. Combines
-	// breaker health, latency, quota, cost and other signals. When no
-	// scorer is wired, StrategyAuto falls back to StrategyFallback.
-	// See PRD v2 Phase 3D.
-	StrategyAuto Strategy = "auto"
+	StrategyAuto       Strategy = "auto"
 )
 
 // Status indicates whether a combo is published, in draft, or disabled.
@@ -52,32 +41,45 @@ type Combo struct {
 	Name        string         `json:"name" yaml:"name"`
 	Description string         `json:"description,omitempty" yaml:"description,omitempty"`
 	Status      Status         `json:"status" yaml:"status"`
-	Strategy    Strategy       `json:"strategy" yaml:"strategy"`
-	StickyLimit int            `json:"sticky_limit,omitempty" yaml:"sticky_limit,omitempty"`
+	LoadBalance bool           `json:"load_balance" yaml:"load_balance"`
 	Entries     []Entry        `json:"entries" yaml:"entries"`
 	Metadata    map[string]any `json:"metadata,omitempty" yaml:"metadata,omitempty"`
 	CreatedAt   time.Time      `json:"created_at" yaml:"created_at"`
 	UpdatedAt   time.Time      `json:"updated_at" yaml:"updated_at"`
+
+	// Strategy is DEPRECATED — kept only for reading legacy storage files.
+	// On load, MigrateStrategy() converts it to LoadBalance and clears it.
+	Strategy    Strategy `json:"strategy,omitempty" yaml:"strategy,omitempty"`
+	StickyLimit int      `json:"sticky_limit,omitempty" yaml:"sticky_limit,omitempty"`
+}
+
+// MigrateStrategy converts the legacy Strategy field to the new LoadBalance
+// bool. Call this after unmarshalling from storage. It is idempotent.
+func (c *Combo) MigrateStrategy() {
+	if c == nil {
+		return
+	}
+	if c.Strategy != "" {
+		switch c.Strategy {
+		case StrategyRoundRobin:
+			c.LoadBalance = true
+		default:
+			c.LoadBalance = false
+		}
+		c.Strategy = ""
+		c.StickyLimit = 0
+	}
 }
 
 // Entry is a single fallback step.
 type Entry struct {
-	// Priority orders entries from lowest (tried first) to highest. Duplicate
-	// priorities are tolerated — they are broken by declaration order.
-	Priority int `json:"priority" yaml:"priority"`
-	// Model is the prefixed upstream identifier (e.g. "cc/claude-opus-4-7").
-	// Bare identifiers are rejected by Validate() to keep combos compatible
-	// with strict prefix mode.
-	Model string `json:"model" yaml:"model"`
-	// TriggerOn lists substrings in the upstream error body that trigger
-	// failover. An empty list means "fall through on any retriable error".
+	Priority  int      `json:"priority" yaml:"priority"`
+	Model     string   `json:"model" yaml:"model"`
 	TriggerOn []string `json:"trigger_on,omitempty" yaml:"trigger_on,omitempty"`
-	// Weight is reserved for weighted round-robin and is currently unused.
-	Weight int `json:"weight,omitempty" yaml:"weight,omitempty"`
+	Weight    int      `json:"weight,omitempty" yaml:"weight,omitempty"`
 }
 
-// Validate checks that a combo is well-formed. It is called on every Upsert
-// and on every resolver read, so it needs to be cheap.
+// Validate checks that a combo is well-formed.
 func (c *Combo) Validate() error {
 	if c == nil {
 		return fmt.Errorf("combo is nil")
@@ -86,19 +88,9 @@ func (c *Combo) Validate() error {
 	if name == "" {
 		return fmt.Errorf("combo name is required")
 	}
-	// Names cannot contain "/" because the request router also uses "/" to
-	// split prefix/model. An accidental "team/my-combo" would otherwise be
-	// mis-routed to a (non-existent) "team" credential.
-	if strings.Contains(name, "/") {
-		return fmt.Errorf("combo name %q must not contain '/'", name)
-	}
-	switch c.Strategy {
-	case "":
-		c.Strategy = StrategyFallback
-	case StrategyFallback, StrategyRoundRobin, StrategyAuto:
-	default:
-		return fmt.Errorf("combo %q has unknown strategy %q", name, c.Strategy)
-	}
+	// Combo names may contain "/" (e.g. "mtr/genfity-2.1"). The resolver
+	// checks combo registry first before splitting prefix/model, so there
+	// is no ambiguity. See docs/PRD-V3-PREFIX-LOADBALANCE.md §4.1.
 	if c.Status == "" {
 		c.Status = StatusActive
 	}
@@ -111,9 +103,6 @@ func (c *Combo) Validate() error {
 		if model == "" {
 			return fmt.Errorf("combo %q entry #%d is missing model", name, i)
 		}
-		// Strict prefix mode requires combo entries to reference prefixed
-		// models. Otherwise one of the fallback steps could land on a
-		// credential that has no canonical owner.
 		if !strings.Contains(model, "/") {
 			return fmt.Errorf("combo %q entry #%d model %q must include a provider prefix (e.g. \"cc/%s\")", name, i, model, model)
 		}
@@ -144,20 +133,10 @@ type Registry struct {
 	mu        sync.RWMutex
 	entries   map[string]*Combo
 	rrCursors map[string]int // round-robin cursor per combo name
-	rrUsed    map[string]int // sticky counter per combo name
 
 	// metrics tracks per-entry outcomes so operators can see which combo
-	// candidates actually succeed and which drag down p95. Nil-safe —
-	// callers that don't install a registry get no-op recording.
+	// candidates actually succeed and which drag down p95. Nil-safe.
 	metrics *MetricsRegistry
-
-	// scorer is an optional pluggable scorer used by StrategyAuto. The
-	// input is an entry's model string; the return is a score in [0..1]
-	// (higher = better). When nil, StrategyAuto degrades to
-	// StrategyFallback behaviour. Set via SetScorer from the host (the
-	// scheduler wires a function that consults resilience.Manager +
-	// LatencyTracker + Quota state).
-	scorer func(model string) float64
 }
 
 // NewRegistry returns an empty in-memory registry with a fresh metrics
@@ -167,7 +146,6 @@ func NewRegistry() *Registry {
 	return &Registry{
 		entries:   make(map[string]*Combo),
 		rrCursors: make(map[string]int),
-		rrUsed:    make(map[string]int),
 		metrics:   NewMetricsRegistry(),
 	}
 }
@@ -190,19 +168,6 @@ func (r *Registry) SetMetrics(m *MetricsRegistry) {
 	}
 	r.mu.Lock()
 	r.metrics = m
-	r.mu.Unlock()
-}
-
-// SetScorer installs an external scorer used by StrategyAuto. The
-// function is called for each candidate model string; return a score
-// in [0..1] (higher = better). Pass nil to disable auto scoring —
-// StrategyAuto then degrades to StrategyFallback behaviour.
-func (r *Registry) SetScorer(fn func(model string) float64) {
-	if r == nil {
-		return
-	}
-	r.mu.Lock()
-	r.scorer = fn
 	r.mu.Unlock()
 }
 
@@ -241,7 +206,6 @@ func (r *Registry) Delete(name string) {
 	r.mu.Lock()
 	delete(r.entries, key)
 	delete(r.rrCursors, key)
-	delete(r.rrUsed, key)
 	r.mu.Unlock()
 }
 
@@ -338,10 +302,9 @@ func sortStrings(s []string) {
 // Resolve returns the ordered candidates for a request. The caller iterates
 // them until one succeeds or the list is exhausted.
 //
-// For StrategyFallback the order is the entries sorted by priority ascending.
-// For StrategyRoundRobin the list is rotated by a per-combo cursor, so the
-// first candidate drifts across requests; within a single request the tail
-// still follows priority order.
+// When LoadBalance is true the list is rotated by a per-combo cursor so the
+// first candidate drifts across requests (round-robin). When false the list
+// is returned sorted by priority ascending (fallback / priority order).
 //
 // Resolve returns (nil, false) when the combo is unknown, disabled, or has no
 // entries — callers should treat that as "not a combo, pass through".
@@ -361,40 +324,11 @@ func (r *Registry) Resolve(name string) ([]Candidate, bool) {
 	ordered := append([]Entry(nil), combo.Entries...)
 	sortEntriesByPriority(ordered)
 
-	if combo.Strategy == StrategyRoundRobin && len(ordered) > 1 {
-		sticky := combo.StickyLimit
-		if sticky < 1 {
-			sticky = 1
-		}
+	if combo.LoadBalance && len(ordered) > 1 {
 		cursor := r.rrCursors[key]
-		used := r.rrUsed[key]
-		if used >= sticky {
-			cursor = (cursor + 1) % len(ordered)
-			used = 0
-		}
+		cursor = (cursor + 1) % len(ordered)
 		r.rrCursors[key] = cursor
-		r.rrUsed[key] = used + 1
 		ordered = rotateEntries(ordered, cursor)
-	}
-
-	// Auto strategy: re-order entries by external scorer, highest first.
-	// When no scorer is installed, fall through to fallback ordering
-	// (which is what `ordered` already is). Stable sort so ties break
-	// by configured priority.
-	if combo.Strategy == StrategyAuto && r.scorer != nil && len(ordered) > 1 {
-		scorer := r.scorer
-		scores := make([]float64, len(ordered))
-		for i, e := range ordered {
-			scores[i] = scorer(e.Model)
-		}
-		// Insertion sort — len <= ~10 entries, simpler than sort.Slice
-		// and avoids the closure capture overhead.
-		for i := 1; i < len(ordered); i++ {
-			for j := i; j > 0 && scores[j] > scores[j-1]; j-- {
-				ordered[j], ordered[j-1] = ordered[j-1], ordered[j]
-				scores[j], scores[j-1] = scores[j-1], scores[j]
-			}
-		}
 	}
 
 	candidates := make([]Candidate, len(ordered))

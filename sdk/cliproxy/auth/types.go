@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -241,6 +242,17 @@ func (a *Auth) Clone() *Auth {
 	}
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth
+}
+
+// Validate checks that the auth record has all required fields populated.
+func (a *Auth) Validate() error {
+	if a == nil {
+		return fmt.Errorf("auth is nil")
+	}
+	if strings.TrimSpace(a.Prefix) == "" {
+		return fmt.Errorf("auth %q: prefix is required", a.ID)
+	}
+	return nil
 }
 
 func stableAuthIndex(seed string) string {

@@ -225,7 +225,16 @@ type QuotaExceeded struct {
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
+	// DEPRECATED: use LoadBalance instead. Kept for backward-compat parsing.
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// LoadBalance controls cross-account routing for the same prefix.
+	//   true  → round-robin across all ready accounts in the prefix (default)
+	//   false → priority-ordered fallback; next account picked only when
+	//           current account is on cooldown (QuotaState.NextRecoverAt)
+	// When nil (absent from YAML), defaults to true unless Strategy == "fill-first".
+	// See docs/PRD-V3-PREFIX-LOADBALANCE.md §5.
+	LoadBalance *bool `yaml:"load-balance,omitempty" json:"load-balance,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
 	// Session IDs are extracted from multiple sources:
@@ -238,6 +247,21 @@ type RoutingConfig struct {
 	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
+}
+
+// IsLoadBalanceEnabled resolves the effective load-balance setting, considering
+// both the new LoadBalance field and the legacy Strategy field.
+func (r *RoutingConfig) IsLoadBalanceEnabled() bool {
+	if r == nil {
+		return true
+	}
+	if r.LoadBalance != nil {
+		return *r.LoadBalance
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Strategy), "fill-first") {
+		return false
+	}
+	return true
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -870,8 +894,10 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 }
 
 // SanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are
-// not actionable, specifically those missing a BaseURL. It trims whitespace before
-// evaluation and preserves the relative order of remaining entries.
+// not actionable: missing a BaseURL, or missing a prefix. See
+// docs/PRD-V3-PREFIX-LOADBALANCE.md §3.1 — prefix is mandatory; entries that
+// have no prefix are dropped from the published config with a warning so they
+// never leak models without the "{prefix}/" namespace.
 func (cfg *Config) SanitizeOpenAICompatibility() {
 	if cfg == nil || len(cfg.OpenAICompatibility) == 0 {
 		return
@@ -887,13 +913,17 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 			// Skip providers with no base-url; treated as removed
 			continue
 		}
+		if e.Prefix == "" {
+			log.Warnf("openai-compatibility provider %q (base %q) has empty prefix; skipping — set a prefix via the panel or config.yaml", e.Name, e.BaseURL)
+			continue
+		}
 		out = append(out, e)
 	}
 	cfg.OpenAICompatibility = out
 }
 
-// SanitizeCodexKeys removes Codex API key entries missing a BaseURL.
-// It trims whitespace and preserves order for remaining entries.
+// SanitizeCodexKeys removes Codex API key entries missing a BaseURL or prefix.
+// Prefix is mandatory; see docs/PRD-V3-PREFIX-LOADBALANCE.md §3.1.
 func (cfg *Config) SanitizeCodexKeys() {
 	if cfg == nil || len(cfg.CodexKey) == 0 {
 		return
@@ -908,26 +938,40 @@ func (cfg *Config) SanitizeCodexKeys() {
 		if e.BaseURL == "" {
 			continue
 		}
+		if e.Prefix == "" {
+			log.Warnf("codex key (base %q) has empty prefix; skipping — set a prefix via the panel or config.yaml", e.BaseURL)
+			continue
+		}
 		out = append(out, e)
 	}
 	cfg.CodexKey = out
 }
 
-// SanitizeClaudeKeys normalizes headers for Claude credentials.
+// SanitizeClaudeKeys normalizes headers for Claude credentials and drops
+// entries without a prefix. Prefix is mandatory; see
+// docs/PRD-V3-PREFIX-LOADBALANCE.md §3.1.
 func (cfg *Config) SanitizeClaudeKeys() {
 	if cfg == nil || len(cfg.ClaudeKey) == 0 {
 		return
 	}
+	out := make([]ClaudeKey, 0, len(cfg.ClaudeKey))
 	for i := range cfg.ClaudeKey {
-		entry := &cfg.ClaudeKey[i]
+		entry := cfg.ClaudeKey[i]
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
+		if entry.Prefix == "" {
+			log.Warnf("claude key (base %q) has empty prefix; skipping — set a prefix via the panel or config.yaml", entry.BaseURL)
+			continue
+		}
+		out = append(out, entry)
 	}
+	cfg.ClaudeKey = out
 }
 
 // SanitizeGeminiKeys deduplicates and normalizes Gemini credentials.
-// It uses API key + base URL as the uniqueness key.
+// Dedupe key is API key + base URL. Entries without a prefix are skipped
+// — prefix is mandatory per docs/PRD-V3-PREFIX-LOADBALANCE.md §3.1.
 func (cfg *Config) SanitizeGeminiKeys() {
 	if cfg == nil {
 		return
@@ -946,6 +990,10 @@ func (cfg *Config) SanitizeGeminiKeys() {
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
+		if entry.Prefix == "" {
+			log.Warnf("gemini key (base %q) has empty prefix; skipping — set a prefix via the panel or config.yaml", entry.BaseURL)
+			continue
+		}
 		uniqueKey := entry.APIKey + "|" + entry.BaseURL
 		if _, exists := seen[uniqueKey]; exists {
 			continue

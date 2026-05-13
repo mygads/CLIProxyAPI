@@ -491,12 +491,12 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	s.configUpdateMu.Lock()
 	defer s.configUpdateMu.Unlock()
 
-	previousStrategy := ""
+	previousLoadBalance := true
 	var previousSessionAffinity bool
 	var previousSessionAffinityTTL string
 	s.cfgMu.RLock()
 	if s.cfg != nil {
-		previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
+		previousLoadBalance = s.cfg.Routing.IsLoadBalanceEnabled()
 		previousSessionAffinity = s.cfg.Routing.SessionAffinity
 		previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
 	}
@@ -511,32 +511,20 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 		return
 	}
 
-	nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
-	normalizeStrategy := func(strategy string) string {
-		switch strategy {
-		case "fill-first", "fillfirst", "ff":
-			return "fill-first"
-		default:
-			return "round-robin"
-		}
-	}
-	previousStrategy = normalizeStrategy(previousStrategy)
-	nextStrategy = normalizeStrategy(nextStrategy)
-
+	nextLoadBalance := newCfg.Routing.IsLoadBalanceEnabled()
 	nextSessionAffinity := newCfg.Routing.SessionAffinity
 	nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
 
-	selectorChanged := previousStrategy != nextStrategy ||
+	selectorChanged := previousLoadBalance != nextLoadBalance ||
 		previousSessionAffinity != nextSessionAffinity ||
 		previousSessionAffinityTTL != nextSessionAffinityTTL
 
 	if s.coreManager != nil && selectorChanged {
 		var selector coreauth.Selector
-		switch nextStrategy {
-		case "fill-first":
-			selector = &coreauth.FillFirstSelector{}
-		default:
+		if nextLoadBalance {
 			selector = &coreauth.RoundRobinSelector{}
+		} else {
+			selector = &coreauth.FillFirstSelector{}
 		}
 
 		if nextSessionAffinity {
@@ -1499,6 +1487,12 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix bool) []*ModelInfo {
 	trimmedPrefix := strings.TrimSpace(prefix)
 	if trimmedPrefix == "" || len(models) == 0 {
+		if len(models) > 0 && forceModelPrefix {
+			// Prefix is mandatory under strict mode. Refusing to publish avoids
+			// cross-provider leakage (see docs/PRD-V3-PREFIX-LOADBALANCE.md §3.1).
+			log.Warnf("applyModelPrefixes: dropping %d model(s) — credential has no prefix in strict mode", len(models))
+			return nil
+		}
 		return models
 	}
 

@@ -21,15 +21,15 @@ func TestValidate_rejectsBareModelInEntry(t *testing.T) {
 	}
 }
 
-func TestValidate_rejectsSlashInName(t *testing.T) {
+func TestValidate_allowsSlashInName(t *testing.T) {
 	c := &Combo{
 		Name: "team/my-combo",
 		Entries: []Entry{
 			{Priority: 1, Model: "cc/claude-opus-4-7"},
 		},
 	}
-	if err := c.Validate(); err == nil {
-		t.Fatal("expected error for slash in combo name")
+	if err := c.Validate(); err != nil {
+		t.Fatalf("slash in combo name should be allowed, got: %v", err)
 	}
 }
 
@@ -46,7 +46,7 @@ func TestValidate_rejectsDuplicateEntries(t *testing.T) {
 	}
 }
 
-func TestValidate_defaultsStrategyAndStatus(t *testing.T) {
+func TestValidate_defaultsStatus(t *testing.T) {
 	c := &Combo{
 		Name: "ok",
 		Entries: []Entry{
@@ -56,9 +56,6 @@ func TestValidate_defaultsStrategyAndStatus(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if c.Strategy != StrategyFallback {
-		t.Errorf("expected default strategy %q, got %q", StrategyFallback, c.Strategy)
-	}
 	if c.Status != StatusActive {
 		t.Errorf("expected default status %q, got %q", StatusActive, c.Status)
 	}
@@ -67,8 +64,8 @@ func TestValidate_defaultsStrategyAndStatus(t *testing.T) {
 func TestResolve_fallbackReturnsPriorityOrder(t *testing.T) {
 	r := NewRegistry()
 	err := r.Upsert(&Combo{
-		Name:     "test",
-		Strategy: StrategyFallback,
+		Name:        "test",
+		LoadBalance: false,
 		Entries: []Entry{
 			{Priority: 2, Model: "cx/gpt-5.5"},
 			{Priority: 1, Model: "cc/claude-opus-4-7"},
@@ -102,12 +99,11 @@ func TestResolve_fallbackReturnsPriorityOrder(t *testing.T) {
 	}
 }
 
-func TestResolve_roundRobinAdvancesFirstEntry(t *testing.T) {
+func TestResolve_loadBalanceRotatesFirstEntry(t *testing.T) {
 	r := NewRegistry()
 	err := r.Upsert(&Combo{
 		Name:        "rr",
-		Strategy:    StrategyRoundRobin,
-		StickyLimit: 1,
+		LoadBalance: true,
 		Entries: []Entry{
 			{Priority: 1, Model: "a/one"},
 			{Priority: 2, Model: "b/two"},
@@ -126,7 +122,7 @@ func TestResolve_roundRobinAdvancesFirstEntry(t *testing.T) {
 		}
 		firstHeads = append(firstHeads, candidates[0].Model)
 	}
-	expected := []string{"a/one", "b/two", "c/three", "a/one", "b/two", "c/three"}
+	expected := []string{"b/two", "c/three", "a/one", "b/two", "c/three", "a/one"}
 	for i, got := range firstHeads {
 		if got != expected[i] {
 			t.Errorf("request %d: expected first head %q, got %q", i, expected[i], got)
@@ -134,34 +130,6 @@ func TestResolve_roundRobinAdvancesFirstEntry(t *testing.T) {
 	}
 }
 
-func TestResolve_stickyLimitHoldsBeforeAdvancing(t *testing.T) {
-	r := NewRegistry()
-	err := r.Upsert(&Combo{
-		Name:        "sticky",
-		Strategy:    StrategyRoundRobin,
-		StickyLimit: 3,
-		Entries: []Entry{
-			{Priority: 1, Model: "a/one"},
-			{Priority: 2, Model: "b/two"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("upsert: %v", err)
-	}
-
-	heads := []string{}
-	for i := 0; i < 5; i++ {
-		candidates, _ := r.Resolve("sticky")
-		heads = append(heads, candidates[0].Model)
-	}
-	// Stuck on a/one for 3 requests, then swap.
-	want := []string{"a/one", "a/one", "a/one", "b/two", "b/two"}
-	for i, got := range heads {
-		if got != want[i] {
-			t.Errorf("request %d: want %q, got %q", i, want[i], got)
-		}
-	}
-}
 
 func TestResolve_disabledComboSkipped(t *testing.T) {
 	r := NewRegistry()

@@ -64,6 +64,7 @@ func (s *FileStore) Load(r *Registry) error {
 		if c == nil {
 			continue
 		}
+		c.MigrateStrategy()
 		if err := r.Upsert(c); err != nil {
 			// Keep loading the rest — an invalid entry shouldn't block
 			// others that are valid. The error is returned as a wrapper

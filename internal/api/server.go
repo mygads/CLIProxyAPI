@@ -353,17 +353,6 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		s.comboStore = comboStore
 		s.mgmt.SetComboRegistry(comboReg, comboStore)
 
-		// Wire the auto-combo scorer so StrategyAuto has real signals
-		// to rank by. The scorer takes a prefix/model string and
-		// returns the composite score of the best-matching credential
-		// — breaker health + latency + success rate. When no auth
-		// manager is available, the default 1.0 keeps StrategyAuto
-		// degrading cleanly to StrategyFallback ordering.
-		if s.handlers != nil && s.handlers.AuthManager != nil {
-			mgr := s.handlers.AuthManager
-			comboReg.SetScorer(mgr.ScoreForModel)
-		}
-
 		// Expose the registry to the request path so combo names in
 		// `model` fields are rewritten to their first candidate before
 		// the provider lookup runs. We wrap the registry in an adapter
@@ -816,6 +805,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/routing/strategy", s.mgmt.GetRoutingStrategy)
 		mgmt.PUT("/routing/strategy", s.mgmt.PutRoutingStrategy)
 		mgmt.PATCH("/routing/strategy", s.mgmt.PutRoutingStrategy)
+		mgmt.GET("/routing/load-balance", s.mgmt.GetLoadBalance)
+		mgmt.PUT("/routing/load-balance", s.mgmt.PutLoadBalance)
+		mgmt.PATCH("/routing/load-balance", s.mgmt.PutLoadBalance)
 
 		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
 		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)
@@ -864,6 +856,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/kimi-auth-url", s.mgmt.RequestKimiToken)
 		mgmt.GET("/github-auth-url", s.mgmt.RequestGitHubToken)
 		mgmt.GET("/kiro-auth-url", s.mgmt.RequestKiroToken)
+		mgmt.POST("/kiro-import-token", s.mgmt.ImportKiroToken)
 		mgmt.GET("/qwen-auth-url", s.mgmt.RequestQwenToken)
 		mgmt.GET("/cline-auth-url", s.mgmt.RequestClineToken)
 		mgmt.GET("/kilocode-auth-url", s.mgmt.RequestKiloCodeToken)

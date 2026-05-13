@@ -9,6 +9,47 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
+// errEmptyPrefix is returned when a management handler rejects a save because
+// the "prefix" field was blank. See docs/PRD-V3-PREFIX-LOADBALANCE.md §3.1 —
+// prefix is mandatory for every BYOK and OAuth credential.
+const errEmptyPrefix = "prefix is required"
+
+// validatePrefix normalises and validates a user-supplied prefix value from a
+// management request body. A zero-length result (after trimming leading/trailing
+// "/" and whitespace) is rejected. Prefix must not contain the "/" separator,
+// otherwise "{prefix}/{model}" routing becomes ambiguous.
+func validatePrefix(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	trimmed = strings.Trim(trimmed, "/")
+	if trimmed == "" {
+		return "", fmt.Errorf("%s", errEmptyPrefix)
+	}
+	if strings.Contains(trimmed, "/") {
+		return "", fmt.Errorf("prefix %q must not contain '/'", trimmed)
+	}
+	return trimmed, nil
+}
+
+// requirePrefix extracts+validates a prefix from a management body, and writes
+// a 400 response if validation fails. Returns ("", false) when the caller
+// should abort. Accepts a nil pointer for "field not sent" on PATCH requests:
+// in that case require=true means "must be present and non-empty".
+func requirePrefix(c *gin.Context, raw *string, require bool) (string, bool) {
+	if raw == nil {
+		if require {
+			c.JSON(400, gin.H{"error": errEmptyPrefix})
+			return "", false
+		}
+		return "", true
+	}
+	val, err := validatePrefix(*raw)
+	if err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return "", false
+	}
+	return val, true
+}
+
 // Generic helpers for list[string]
 func (h *Handler) putStringList(c *gin.Context, set func([]string), after func()) {
 	data, err := c.GetRawData()
@@ -198,7 +239,11 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		entry.APIKey = trimmed
 	}
 	if body.Value.Prefix != nil {
-		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
+		val, ok := requirePrefix(c, body.Value.Prefix, false)
+		if !ok {
+			return
+		}
+		entry.Prefix = val
 	}
 	if body.Value.BaseURL != nil {
 		entry.BaseURL = strings.TrimSpace(*body.Value.BaseURL)
@@ -350,7 +395,11 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
 	}
 	if body.Value.Prefix != nil {
-		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
+		val, ok := requirePrefix(c, body.Value.Prefix, false)
+		if !ok {
+			return
+		}
+		entry.Prefix = val
 	}
 	if body.Value.BaseURL != nil {
 		entry.BaseURL = strings.TrimSpace(*body.Value.BaseURL)
@@ -505,7 +554,11 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		entry.Name = strings.TrimSpace(*body.Value.Name)
 	}
 	if body.Value.Prefix != nil {
-		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
+		val, ok := requirePrefix(c, body.Value.Prefix, false)
+		if !ok {
+			return
+		}
+		entry.Prefix = val
 	}
 	if body.Value.Disabled != nil {
 		entry.Disabled = *body.Value.Disabled
@@ -651,7 +704,11 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 		entry.APIKey = trimmed
 	}
 	if body.Value.Prefix != nil {
-		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
+		val, ok := requirePrefix(c, body.Value.Prefix, false)
+		if !ok {
+			return
+		}
+		entry.Prefix = val
 	}
 	if body.Value.BaseURL != nil {
 		trimmed := strings.TrimSpace(*body.Value.BaseURL)
@@ -998,7 +1055,11 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
 	}
 	if body.Value.Prefix != nil {
-		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
+		val, ok := requirePrefix(c, body.Value.Prefix, false)
+		if !ok {
+			return
+		}
+		entry.Prefix = val
 	}
 	if body.Value.BaseURL != nil {
 		trimmed := strings.TrimSpace(*body.Value.BaseURL)
