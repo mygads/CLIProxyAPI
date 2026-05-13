@@ -152,6 +152,9 @@ type Manager struct {
 	mu        sync.RWMutex
 	auths     map[string]*Auth
 	scheduler *authScheduler
+	// homeRuntimeAuths caches auths returned by Home so websocket sessions can
+	// reuse an established upstream credential without dispatching every turn.
+	homeRuntimeAuths map[string]map[string]*Auth
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets map[string]int
 
@@ -211,6 +214,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		selector:         selector,
 		hook:             hook,
 		auths:            make(map[string]*Auth),
+		homeRuntimeAuths: make(map[string]map[string]*Auth),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
 		breakers:         resilience.NewDefaultManager(),
@@ -404,6 +408,9 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
+	if !cfg.Home.Enabled {
+		m.clearHomeRuntimeAuths()
+	}
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
@@ -2712,6 +2719,40 @@ func statusCodeFromError(err error) int {
 	return 0
 }
 
+func isUnauthorizedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if statusCodeFromError(err) == http.StatusUnauthorized {
+		return true
+	}
+	raw := strings.ToLower(err.Error())
+	return strings.Contains(raw, "status 401") || strings.Contains(raw, "401 unauthorized")
+}
+
+func hasUnauthorizedAuthFailure(auth *Auth) bool {
+	if auth == nil || auth.LastError == nil {
+		return false
+	}
+	return auth.LastError.StatusCode() == http.StatusUnauthorized || strings.EqualFold(auth.LastError.Code, "unauthorized")
+}
+
+func refreshErrorFromError(err error) *Error {
+	if err == nil {
+		return nil
+	}
+	statusCode := statusCodeFromError(err)
+	if statusCode == 0 && isUnauthorizedError(err) {
+		statusCode = http.StatusUnauthorized
+	}
+	authErr := &Error{Message: err.Error(), HTTPStatus: statusCode}
+	if statusCode == http.StatusUnauthorized {
+		authErr.Code = "unauthorized"
+		authErr.Retryable = false
+	}
+	return authErr
+}
+
 func retryAfterFromError(err error) *time.Duration {
 	if err == nil {
 		return nil
@@ -2951,6 +2992,23 @@ func (m *Manager) GetByID(id string) (*Auth, bool) {
 	return auth.Clone(), true
 }
 
+// GetExecutionSessionAuthByID retrieves a Home runtime auth scoped to an execution session.
+func (m *Manager) GetExecutionSessionAuthByID(sessionID string, authID string) (*Auth, bool) {
+	sessionID = strings.TrimSpace(sessionID)
+	authID = strings.TrimSpace(authID)
+	if m == nil || sessionID == "" || authID == "" {
+		return nil, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	sessionAuths := m.homeRuntimeAuths[sessionID]
+	auth := sessionAuths[authID]
+	if auth == nil {
+		return nil, false
+	}
+	return auth.Clone(), true
+}
+
 // Executor returns the registered provider executor for a provider key.
 func (m *Manager) Executor(provider string) (ProviderExecutor, bool) {
 	if m == nil {
@@ -2984,12 +3042,17 @@ func (m *Manager) CloseExecutionSession(sessionID string) {
 		return
 	}
 
-	m.mu.RLock()
+	m.mu.Lock()
+	if sessionID == CloseAllExecutionSessionsID {
+		m.clearHomeRuntimeAuthsLocked()
+	} else {
+		m.clearHomeRuntimeAuthsForSessionLocked(sessionID)
+	}
 	executors := make([]ProviderExecutor, 0, len(m.executors))
 	for _, exec := range m.executors {
 		executors = append(executors, exec)
 	}
-	m.mu.RUnlock()
+	m.mu.Unlock()
 
 	for i := range executors {
 		if closer, ok := executors[i].(ExecutionSessionCloser); ok && closer != nil {
@@ -3029,7 +3092,7 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if m.HomeEnabled() {
-		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts)
+		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
 		return auth, exec, err
 	}
 
@@ -3103,7 +3166,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if m.HomeEnabled() {
-		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts)
+		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
 		return auth, exec, err
 	}
 
@@ -3165,7 +3228,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 
 func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if m.HomeEnabled() {
-		return m.pickNextViaHome(ctx, model, opts)
+		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
@@ -3261,7 +3324,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if m.HomeEnabled() {
-		return m.pickNextViaHome(ctx, model, opts)
+		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
 
 	if !m.useSchedulerFastPath() {
@@ -3401,13 +3464,120 @@ func setHomeUserAPIKeyOnGinContext(ctx context.Context, apiKey string) {
 	ginCtx.Set("userApiKey", apiKey)
 }
 
-func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts cliproxyexecutor.Options) (*Auth, ProviderExecutor, string, error) {
+func homeExecutionSessionIDFromMetadata(meta map[string]any) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	raw, ok := meta[cliproxyexecutor.ExecutionSessionMetadataKey]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []byte:
+		return strings.TrimSpace(string(value))
+	default:
+		return ""
+	}
+}
+
+func (m *Manager) clearHomeRuntimeAuths() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.clearHomeRuntimeAuthsLocked()
+	m.mu.Unlock()
+}
+
+func (m *Manager) clearHomeRuntimeAuthsLocked() {
+	if m == nil {
+		return
+	}
+	m.homeRuntimeAuths = make(map[string]map[string]*Auth)
+}
+
+func (m *Manager) clearHomeRuntimeAuthsForSessionLocked(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if m == nil || sessionID == "" {
+		return
+	}
+	delete(m.homeRuntimeAuths, sessionID)
+}
+
+func (m *Manager) rememberHomeRuntimeAuth(sessionID string, auth *Auth) {
+	sessionID = strings.TrimSpace(sessionID)
+	authID := ""
+	if auth != nil {
+		authID = strings.TrimSpace(auth.ID)
+	}
+	if m == nil || auth == nil || sessionID == "" || authID == "" || !authWebsocketsEnabled(auth) {
+		return
+	}
+	m.mu.Lock()
+	if m.homeRuntimeAuths == nil {
+		m.homeRuntimeAuths = make(map[string]map[string]*Auth)
+	}
+	sessionAuths := m.homeRuntimeAuths[sessionID]
+	if sessionAuths == nil {
+		sessionAuths = make(map[string]*Auth)
+		m.homeRuntimeAuths[sessionID] = sessionAuths
+	}
+	sessionAuths[authID] = auth.Clone()
+	m.mu.Unlock()
+}
+
+func (m *Manager) homeRuntimeAuthByID(sessionID string, authID string) (*Auth, ProviderExecutor, string, bool) {
+	sessionID = strings.TrimSpace(sessionID)
+	authID = strings.TrimSpace(authID)
+	if m == nil || sessionID == "" || authID == "" {
+		return nil, nil, "", false
+	}
+	m.mu.RLock()
+	sessionAuths := m.homeRuntimeAuths[sessionID]
+	auth := sessionAuths[authID]
+	m.mu.RUnlock()
+	if auth == nil || !authWebsocketsEnabled(auth) {
+		return nil, nil, "", false
+	}
+	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if providerKey == "" {
+		return nil, nil, "", false
+	}
+	executor, ok := m.Executor(providerKey)
+	if !ok && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["base_url"]) != "" {
+		executor, ok = m.Executor("openai-compatibility")
+		if ok {
+			providerKey = "openai-compatibility"
+		}
+	}
+	if !ok {
+		return nil, nil, "", false
+	}
+	return auth.Clone(), executor, providerKey, true
+}
+
+func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if m == nil {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	executionSessionID := homeExecutionSessionIDFromMetadata(opts.Metadata)
+	count := homeAuthCountFromMetadata(opts.Metadata)
+	if cliproxyexecutor.DownstreamWebsocket(ctx) && executionSessionID != "" && count <= 1 {
+		if pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata); pinnedAuthID != "" {
+			_, alreadyTried := tried[pinnedAuthID]
+			if !alreadyTried {
+				if auth, executor, providerKey, ok := m.homeRuntimeAuthByID(executionSessionID, pinnedAuthID); ok {
+					return auth, executor, providerKey, nil
+				}
+			}
+		}
+	}
+
 	client := home.Current()
 	if client == nil || !client.HeartbeatOK() {
 		return nil, nil, "", &Error{Code: "home_unavailable", Message: "home control center unavailable", HTTPStatus: http.StatusServiceUnavailable}
@@ -3415,7 +3585,6 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 
 	requestedModel := requestedModelFromMetadata(opts.Metadata, model)
 	sessionID := ExtractSessionID(opts.Headers, opts.OriginalRequest, opts.Metadata)
-	count := homeAuthCountFromMetadata(opts.Metadata)
 
 	raw, err := client.RPopAuth(ctx, requestedModel, sessionID, opts.Headers, count)
 	if err != nil {
@@ -3487,7 +3656,11 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered", HTTPStatus: http.StatusBadGateway}
 	}
 
-	return auth.Clone(), executor, providerKey, nil
+	authCopy := auth.Clone()
+	if cliproxyexecutor.DownstreamWebsocket(ctx) && executionSessionID != "" && authWebsocketsEnabled(authCopy) {
+		m.rememberHomeRuntimeAuth(executionSessionID, authCopy)
+	}
+	return authCopy, executor, providerKey, nil
 }
 
 func requestedModelFromMetadata(metadata map[string]any, fallback string) string {
@@ -3774,6 +3947,9 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if a == nil {
 		return false
 	}
+	if hasUnauthorizedAuthFailure(a) {
+		return false
+	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
 		return false
 	}
@@ -4018,11 +4194,19 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
+		unauthorized := isUnauthorizedError(err)
 		shouldReschedule := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-			current.LastError = &Error{Message: err.Error()}
+			current.LastError = refreshErrorFromError(err)
+			if unauthorized {
+				current.NextRefreshAfter = time.Time{}
+				current.Unavailable = true
+				current.Status = StatusError
+				current.StatusMessage = "unauthorized"
+			} else {
+				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+			}
 			m.auths[id] = current
 			shouldReschedule = true
 			if m.scheduler != nil {
