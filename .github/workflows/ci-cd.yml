@@ -135,6 +135,8 @@ jobs:
             cd ~/genfity/ai-core2
 
             if [ -d .git ]; then
+              # Fix ownership of files that Docker may have created as root
+              sudo chown -R $(whoami):$(whoami) .
               # Force pull latest changes (override local, no conflicts)
               git remote set-url origin https://x-access-token:${GHCR_TOKEN}@github.com/${{ github.repository }}.git
               git fetch origin main
