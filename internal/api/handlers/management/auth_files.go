@@ -1122,7 +1122,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
-// PatchAuthFileFields updates editable fields (prefix, proxy_url, headers, priority, note) of an auth file.
+// PatchAuthFileFields updates editable fields (prefix, proxy_url, headers, priority, note, label) of an auth file.
 func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -1136,6 +1136,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		Headers  map[string]string `json:"headers"`
 		Priority *int              `json:"priority"`
 		Note     *string           `json:"note"`
+		Label    *string           `json:"label"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -1302,6 +1303,20 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		changed = true
 	}
 
+	if req.Label != nil {
+		label := strings.TrimSpace(*req.Label)
+		targetAuth.Label = label
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if label == "" {
+			delete(targetAuth.Metadata, "label")
+		} else {
+			targetAuth.Metadata["label"] = label
+		}
+		changed = true
+	}
+
 	if !changed {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
 		return
@@ -1315,6 +1330,112 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// TestAuthFileModel sends a minimal chat completion request to verify an auth entry works with a given model.
+// It makes a loopback HTTP call to the proxy's own /v1/chat/completions endpoint using the auth file's index.
+func (h *Handler) TestAuthFileModel(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Name  string `json:"name"`
+		Model string `json:"model"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	model := strings.TrimSpace(req.Model)
+	if name == "" || model == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name and model are required"})
+		return
+	}
+
+	// Find auth entry
+	var targetAuth *coreauth.Auth
+	if auth, ok := h.authManager.GetByID(name); ok {
+		targetAuth = auth
+	} else {
+		for _, auth := range h.authManager.List() {
+			if auth.FileName == name {
+				targetAuth = auth
+				break
+			}
+		}
+	}
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+
+	// Build loopback URL from the incoming request's host
+	scheme := "http"
+	host := c.Request.Host
+	if host == "" {
+		host = "127.0.0.1:8317"
+	}
+	targetURL := scheme + "://" + host + "/v1/chat/completions"
+
+	// Minimal chat completion payload
+	payload := map[string]any{
+		"model":      model,
+		"max_tokens": 1,
+		"messages": []map[string]string{
+			{"role": "user", "content": "hi"},
+		},
+	}
+	payloadBytes, _ := json.Marshal(payload)
+
+	httpReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, targetURL, bytes.NewReader(payloadBytes))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build request"})
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	// Use management key for auth, plus auth index header to pin to specific credential
+	if h.cfg != nil && len(h.cfg.APIKeys) > 0 {
+		httpReq.Header.Set("Authorization", "Bearer "+h.cfg.APIKeys[0])
+	}
+	authIndex := targetAuth.EnsureIndex()
+	if authIndex != "" {
+		httpReq.Header.Set("X-Auth-Index", authIndex)
+	}
+
+	start := time.Now()
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(httpReq)
+	latencyMs := time.Since(start).Milliseconds()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"ok": false, "error": err.Error(), "latency_ms": latencyMs})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		c.JSON(http.StatusOK, gin.H{"ok": true, "latency_ms": latencyMs, "status": resp.StatusCode})
+		return
+	}
+
+	var errMsg string
+	var errBody map[string]any
+	if json.Unmarshal(body, &errBody) == nil {
+		if e, ok := errBody["error"]; ok {
+			errMsg = fmt.Sprintf("%v", e)
+		}
+	}
+	if errMsg == "" {
+		errMsg = strings.TrimSpace(string(body))
+		if len(errMsg) > 200 {
+			errMsg = errMsg[:200]
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": false, "error": errMsg, "latency_ms": latencyMs, "status": resp.StatusCode})
 }
 
 func (h *Handler) disableAuth(ctx context.Context, id string) {
