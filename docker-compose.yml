@@ -18,6 +18,8 @@
       - "127.0.0.1:8317:8317"
     volumes:
       - ${CLI_PROXY_CONFIG_PATH:-./config.yaml}:/CLIProxyAPI/config.yaml
+      - ./static:/data/cliproxy/objectstore/objectstore/config/static
+      - ./auths:/data/cliproxy/objectstore/objectstore/auths
     restart: unless-stopped
     networks:
       - genfity-network

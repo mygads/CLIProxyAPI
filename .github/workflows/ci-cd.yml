@@ -106,8 +106,18 @@ jobs:
             printf '%s' "$ENV_FILE" | ssh $VPS_USER@$VPS_HOST "mkdir -p /home/$VPS_USER/genfity/ai-core2 && cat > /tmp/cliproxy.env && sudo install -m 600 -o root -g root /tmp/cliproxy.env /home/$VPS_USER/genfity/ai-core2/.env && rm -f /tmp/cliproxy.env"
           fi
           if [ -n "$CONFIG_YAML" ]; then
-            echo "Updating config.yaml file on server..."
-            printf '%s' "$CONFIG_YAML" | ssh $VPS_USER@$VPS_HOST "mkdir -p /home/$VPS_USER/genfity/ai-core2 && cat > /tmp/cliproxy.yaml && sudo install -m 600 -o root -g root /tmp/cliproxy.yaml /home/$VPS_USER/genfity/ai-core2/config.yaml && rm -f /tmp/cliproxy.yaml"
+            echo "Checking config.yaml on server..."
+            ssh $VPS_USER@$VPS_HOST "
+              if [ ! -f /home/$VPS_USER/genfity/ai-core2/config.yaml ]; then
+                echo 'config.yaml not found, writing initial config...'
+                cat > /tmp/cliproxy.yaml
+                sudo install -m 600 -o root -g root /tmp/cliproxy.yaml /home/$VPS_USER/genfity/ai-core2/config.yaml
+                rm -f /tmp/cliproxy.yaml
+              else
+                echo 'config.yaml already exists, skipping overwrite (managed via Management API)'
+                cat > /dev/null
+              fi
+            " <<< "$CONFIG_YAML"
           fi
 
       - name: Deploy with Docker Compose
