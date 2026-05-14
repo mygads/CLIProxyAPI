@@ -80,11 +80,33 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup SSH
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
         run: |
+          if [ -z "$VPS_HOST" ]; then
+            echo "❌ VPS_HOST secret is empty or not set"
+            exit 1
+          fi
+          if [ -z "$VPS_SSH_KEY" ]; then
+            echo "❌ VPS_SSH_KEY secret is empty or not set"
+            exit 1
+          fi
           mkdir -p ~/.ssh
-          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          printf '%s' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts
+          # ssh-keyscan can fail transiently; retry up to 3 times
+          for i in 1 2 3; do
+            if ssh-keyscan -H -T 10 "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null; then
+              break
+            fi
+            echo "⚠️ ssh-keyscan attempt $i failed, retrying..."
+            sleep 5
+          done
+          if [ ! -s ~/.ssh/known_hosts ]; then
+            echo "❌ ssh-keyscan failed after 3 attempts — VPS may be unreachable"
+            exit 1
+          fi
           printf 'Host *\n  ServerAliveInterval 60\n  ServerAliveCountMax 10\n' >> ~/.ssh/config
 
       - name: Verify secrets
