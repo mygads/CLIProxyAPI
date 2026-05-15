@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	cliproxyusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -258,7 +259,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, statusErr{code: httpResp.StatusCode, msg: string(b)}
 	}
 
-	assembled, err := assembleKiroResponse(ctx, e.cfg, httpResp.Body, baseModel)
+	assembled, err := assembleKiroResponse(ctx, e.cfg, httpResp.Body, baseModel, openaiBody)
 	if err != nil {
 		return resp, err
 	}
@@ -538,7 +539,28 @@ func indexOf(s []string, v string) int {
 	}
 	return -1
 }
-func assembleKiroResponse(ctx context.Context, cfg *config.Config, body io.Reader, model string) ([]byte, error) {
+func estimateTokensFromContent(openaiBody []byte) int64 {
+	messages := gjson.GetBytes(openaiBody, "messages")
+	if !messages.Exists() {
+		return 0
+	}
+	var total int64
+	for _, msg := range messages.Array() {
+		content := msg.Get("content")
+		if content.Type == gjson.String {
+			total += int64(len(content.String()))
+		} else if content.IsArray() {
+			for _, part := range content.Array() {
+				if part.Get("type").String() == "text" {
+					total += int64(len(part.Get("text").String()))
+				}
+			}
+		}
+	}
+	return total / 4
+}
+
+func assembleKiroResponse(ctx context.Context, cfg *config.Config, body io.Reader, model string, openaiBody []byte) ([]byte, error) {
 	dec := eventstream.NewDecoder(body)
 	state := &kiroStreamState{}
 	for {
@@ -600,6 +622,15 @@ func assembleKiroResponse(ctx context.Context, cfg *config.Config, body io.Reade
 				"cache_creation_tokens": state.usage.CacheCreationTokens,
 			}
 		}
+	} else {
+		promptEst := estimateTokensFromContent(openaiBody)
+		completionEst := int64(state.content.Len()+state.reasoning.Len()) / 4
+		if completionEst < 1 && state.content.Len() > 0 {
+			completionEst = 1
+		}
+		usage["prompt_tokens"] = promptEst
+		usage["completion_tokens"] = completionEst
+		usage["total_tokens"] = promptEst + completionEst
 	}
 	resp := map[string]any{
 		"id":      fmt.Sprintf("chatcmpl-%d", now),
@@ -695,6 +726,28 @@ func streamKiroResponseAsOpenAI(
 	if len(state.toolOrder) > 0 {
 		finishReason = "tool_calls"
 	}
+
+	if state.usage != nil {
+		reporter.Publish(ctx, cliproxyusage.Detail{
+			InputTokens:         state.usage.InputTokens,
+			OutputTokens:        state.usage.OutputTokens,
+			CacheReadTokens:     state.usage.CacheReadTokens,
+			CacheCreationTokens: state.usage.CacheCreationTokens,
+			TotalTokens:         state.usage.InputTokens + state.usage.OutputTokens,
+		})
+	} else {
+		promptEst := estimateTokensFromContent(translatedRequest)
+		completionEst := int64(state.content.Len()+state.reasoning.Len()) / 4
+		if completionEst < 1 && state.content.Len() > 0 {
+			completionEst = 1
+		}
+		reporter.Publish(ctx, cliproxyusage.Detail{
+			InputTokens:  promptEst,
+			OutputTokens: completionEst,
+			TotalTokens:  promptEst + completionEst,
+		})
+	}
+
 	emit(buildSSEChunk(streamID, now, model, nil, finishReason))
 	emit([]byte("[DONE]"))
 }
