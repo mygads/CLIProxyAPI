@@ -643,7 +643,28 @@ func (h *BaseAPIHandler) executeSingle(ctx context.Context, handlerType, modelNa
 
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
+//
+// Combo fallback iterates the resolved attempt list the same way
+// ExecuteWithAuthManager does — without it, count-tokens requests against
+// a combo would only ever hit the head entry and never recover when it
+// goes dead.
 func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	for _, attempt := range h.resolveModelAttempts(modelName) {
+		resp, headers, errMsg := h.executeCountSingle(ctx, handlerType, attempt.Model, rawJSON, alt)
+		if errMsg == nil {
+			return resp, headers, nil
+		}
+		if attempt.IsLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
+			return nil, nil, errMsg
+		}
+	}
+	return nil, nil, &interfaces.ErrorMessage{
+		StatusCode: http.StatusInternalServerError,
+		Error:      fmt.Errorf("combo fallback (count): no candidates produced for %q", modelName),
+	}
+}
+
+func (h *BaseAPIHandler) executeCountSingle(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
@@ -692,7 +713,171 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 // ExecuteStreamWithAuthManager executes a streaming request via the core auth manager.
 // This path is the only supported execution route.
 // The returned http.Header carries upstream response headers captured before streaming begins.
+//
+// Combo fallback iterates the resolved attempt list. Fallback only fires
+// while the upstream has produced no payload bytes — once any byte
+// reaches the goroutine's sendData, the response is committed to that
+// candidate and a later upstream failure surfaces as-is. Bootstrap
+// recovery (auth rotation within the same candidate) still runs and is
+// orthogonal to combo iteration.
 func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	attempts := h.resolveModelAttempts(modelName)
+	// Single-candidate path skips the buffered indirection so existing
+	// non-combo behaviour stays bit-for-bit identical (header timing,
+	// keep-alives, bootstrap retries).
+	if len(attempts) <= 1 {
+		target := modelName
+		if len(attempts) == 1 {
+			target = attempts[0].Model
+		}
+		return h.executeStreamSingle(ctx, handlerType, target, rawJSON, alt)
+	}
+
+	// Multi-candidate combo path. Try each entry; the first one that
+	// successfully bootstraps wins. We attach a buffered channel pair to
+	// the caller and pump each underlying single-attempt stream through
+	// it. On bootstrap failure (status not yet sent → no bytes flushed),
+	// we drop the candidate and try the next.
+	dataChan := make(chan []byte)
+	errChan := make(chan *interfaces.ErrorMessage, 1)
+	headers := make(http.Header)
+
+	go func() {
+		defer close(dataChan)
+		defer close(errChan)
+
+		var lastErr *interfaces.ErrorMessage
+		for i, attempt := range attempts {
+			if ctx != nil {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+			}
+			subData, subHeaders, subErr := h.executeStreamSingle(ctx, handlerType, attempt.Model, rawJSON, alt)
+			// Pump bytes/errors. forwardStreamAttempt returns true when
+			// any payload was forwarded — at that point we are committed
+			// and cannot fall back regardless of subsequent errors.
+			committed, errMsg := forwardStreamAttempt(ctx, subData, subErr, dataChan, errChan, headers, subHeaders)
+			if committed {
+				return
+			}
+			if errMsg == nil {
+				// Stream closed cleanly without forwarding any payload —
+				// treat as a soft success from the upstream's POV. The
+				// caller probably wants a 200 with empty body; the
+				// underlying handler decides. There's nothing more to do.
+				return
+			}
+			lastErr = errMsg
+			isLast := attempt.IsLast || i == len(attempts)-1
+			if isLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
+				_ = sendStreamErr(ctx, errChan, errMsg)
+				return
+			}
+			// Otherwise try the next combo entry.
+		}
+		if lastErr != nil {
+			_ = sendStreamErr(ctx, errChan, lastErr)
+		}
+	}()
+
+	return dataChan, headers, errChan
+}
+
+// forwardStreamAttempt drains a single-attempt stream and forwards
+// payload chunks + headers to the caller-facing channels. It returns
+// (committed, errMsg):
+//   - committed=true when at least one payload chunk was forwarded; the
+//     outer combo loop must not fall back because client bytes are
+//     already on the wire.
+//   - committed=false, errMsg!=nil when the stream errored before any
+//     bytes flushed; combo loop may try the next entry.
+//   - committed=false, errMsg=nil when the stream ended cleanly with no
+//     payload (shouldn't normally happen but treated as terminal).
+func forwardStreamAttempt(
+	ctx context.Context,
+	subData <-chan []byte,
+	subErr <-chan *interfaces.ErrorMessage,
+	dataChan chan<- []byte,
+	errChan chan<- *interfaces.ErrorMessage,
+	headers http.Header,
+	subHeaders http.Header,
+) (bool, *interfaces.ErrorMessage) {
+	// Adopt the underlying stream's headers up-front so combo entries
+	// that share a header set still surface the right Content-Type etc.
+	// We replace rather than merge — last attempt's headers win, which
+	// is the same contract the legacy single-candidate path had.
+	replaceHeader(headers, subHeaders)
+
+	committed := false
+	for subData != nil || subErr != nil {
+		select {
+		case <-doneCh(ctx):
+			return committed, nil
+		case chunk, ok := <-subData:
+			if !ok {
+				subData = nil
+				continue
+			}
+			committed = true
+			if !sendStreamData(ctx, dataChan, chunk) {
+				return committed, nil
+			}
+		case msg, ok := <-subErr:
+			if !ok {
+				subErr = nil
+				continue
+			}
+			if msg != nil {
+				return committed, msg
+			}
+		}
+	}
+	return committed, nil
+}
+
+func doneCh(ctx context.Context) <-chan struct{} {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Done()
+}
+
+func sendStreamData(ctx context.Context, ch chan<- []byte, chunk []byte) bool {
+	if ctx == nil {
+		ch <- chunk
+		return true
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case ch <- chunk:
+		return true
+	}
+}
+
+func sendStreamErr(ctx context.Context, ch chan<- *interfaces.ErrorMessage, msg *interfaces.ErrorMessage) bool {
+	if msg == nil {
+		return false
+	}
+	if ctx == nil {
+		ch <- msg
+		return true
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case ch <- msg:
+		return true
+	}
+}
+
+// executeStreamSingle is the original single-attempt streaming path
+// extracted so combo fallback can iterate over candidates without
+// duplicating bootstrap-retry, keep-alive, and header bookkeeping.
+func (h *BaseAPIHandler) executeStreamSingle(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -955,27 +1140,119 @@ func (h *BaseAPIHandler) resolveModelAttempts(modelName string) []modelAttempt {
 // should cause the loop to try the next entry. It mirrors the logic in
 // internal/combo.ShouldFallback but operates on the handler-layer error
 // type so the SDK package stays free of internal imports.
+//
+// The classifier is a *blacklist*: anything that is not a clear user
+// payload error or a successful response should fall through to the
+// next combo entry. Provider-side failures (401/402/403/404/410/429/5xx
+// and 400 model_not_supported) all indicate "this candidate cannot
+// serve the request right now", which is exactly what combos exist to
+// route around. Returning the upstream error directly to the user when
+// later entries could have served it is what made `genfity/gpt-5.5`
+// surface 400/403 to the client even though a healthy entry existed
+// further down the chain.
+//
+// User-side errors (clear "this request is malformed" signals) must NOT
+// trigger fallback — retrying a different model with the same broken
+// payload just costs latency and credentials.
 func comboShouldFallback(errMsg *interfaces.ErrorMessage, triggers []string) bool {
 	if errMsg == nil {
 		return false
 	}
 	status := errMsg.StatusCode
-	switch status {
-	case 429, 500, 502, 503, 504:
-		// Retriable status — check trigger keywords if any.
-	default:
+	body := ""
+	if errMsg.Error != nil {
+		body = errMsg.Error.Error()
+	}
+	if !comboStatusEligibleForFallback(status, body) {
 		return false
 	}
 	if len(triggers) == 0 {
 		return true
 	}
-	body := ""
-	if errMsg.Error != nil {
-		body = strings.ToLower(errMsg.Error.Error())
-	}
+	lower := strings.ToLower(body)
 	for _, t := range triggers {
 		needle := strings.ToLower(strings.TrimSpace(t))
-		if needle != "" && strings.Contains(body, needle) {
+		if needle != "" && strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// comboStatusEligibleForFallback decides whether a given status + body
+// combination is the "provider failed, try the next entry" case. The
+// table is a deny-list anchored on shapes the gateway is confident are
+// user errors; anything else falls through.
+//
+//	200/201/204               → success, do not fall through
+//	400 + invalid_request_*   → user payload bug, do not fall through
+//	400 + model_not_supported → provider says this auth/account cannot
+//	                            serve this model → DO fall through
+//	422                       → request shape error, do not fall through
+//	other                     → fall through (provider-side failure)
+//
+// The 0 case (no status code, e.g. transport error before headers
+// arrived) is treated as eligible: better to retry on the next entry
+// than surface "internal server error" to the user.
+func comboStatusEligibleForFallback(status int, body string) bool {
+	switch {
+	case status == 0:
+		return true
+	case status >= 200 && status < 300:
+		return false
+	case status == http.StatusBadRequest:
+		// 400 model_not_supported = provider rejecting the model on this
+		// credential. Combo's whole point is to retry on a different
+		// credential/upstream — let the loop continue.
+		if isModelSupportBodyMessage(body) {
+			return true
+		}
+		// Other 400s are payload-shape errors. Forwarding to another
+		// combo entry will just produce the same error.
+		lower := strings.ToLower(body)
+		if strings.Contains(lower, "invalid_request_error") ||
+			strings.Contains(lower, "invalid_argument") ||
+			strings.Contains(lower, "failed_precondition") {
+			return false
+		}
+		// Unknown 400 shape — be conservative and try the next entry.
+		// Wrong fallback wastes one retry; wrong "no fallback" hides a
+		// healthy candidate from the user.
+		return true
+	case status == http.StatusUnprocessableEntity:
+		// 422 is reserved for request shape errors in OpenAI / Anthropic
+		// schemas. Trying another model won't fix the request.
+		return false
+	default:
+		// 401/402/403/404/408/410/429/5xx and anything else — these are
+		// provider-side failures (auth dead, quota exhausted, upstream
+		// down). Combo's job is to route around them.
+		return true
+	}
+}
+
+// isModelSupportBodyMessage matches the same patterns the auth conductor
+// uses to detect "this credential does not support this model" errors.
+// Kept in sync with sdk/cliproxy/auth/conductor.go isModelSupportErrorMessage.
+func isModelSupportBodyMessage(body string) bool {
+	lower := strings.ToLower(strings.TrimSpace(body))
+	if lower == "" {
+		return false
+	}
+	patterns := [...]string{
+		"model_not_supported",
+		"requested model is not supported",
+		"requested model is unsupported",
+		"requested model is unavailable",
+		"model is not supported",
+		"model not supported",
+		"unsupported model",
+		"model unavailable",
+		"not available for your plan",
+		"not available for your account",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(lower, pattern) {
 			return true
 		}
 	}
