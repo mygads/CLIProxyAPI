@@ -168,6 +168,17 @@ func (a *comboResolverAdapter) Candidates(name string) ([]handlers.ComboCandidat
 	return out, true
 }
 
+// ListNames satisfies the optional interface OpenAIModels uses to inject
+// combo names into /v1/models. Without this the type assertion in
+// `sdk/api/handlers/openai/openai_handlers.go` (`h.Combos.(interface{ ListNames() []string })`)
+// would fail and combos would be invisible to clients.
+func (a *comboResolverAdapter) ListNames() []string {
+	if a == nil || a.reg == nil {
+		return nil
+	}
+	return a.reg.ListNames()
+}
+
 // Server represents the main API server.
 // It encapsulates the Gin engine, HTTP server, handlers, and configuration.
 type Server struct {
