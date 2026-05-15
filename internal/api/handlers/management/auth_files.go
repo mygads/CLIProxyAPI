@@ -1372,11 +1372,18 @@ func (h *Handler) TestAuthFileModel(c *gin.Context) {
 		return
 	}
 
-	// Build loopback URL from the incoming request's host
+	// Build loopback URL — always hit the local listener directly to avoid
+	// going through nginx/CDN. The incoming request may be served via a
+	// reverse proxy (e.g. ai-core2.genfity.com), and using c.Request.Host
+	// would send the loopback round-trip back through nginx, which then
+	// 301-redirects the outbound `http://` request and reads the redirect
+	// body as a 404. Pin to localhost + the configured listener port
+	// (or fall back to the well-known 8317 default) so the request stays
+	// inside the container.
 	scheme := "http"
-	host := c.Request.Host
-	if host == "" {
-		host = "127.0.0.1:8317"
+	host := "127.0.0.1:8317"
+	if h.cfg != nil && h.cfg.Port > 0 {
+		host = fmt.Sprintf("127.0.0.1:%d", h.cfg.Port)
 	}
 	targetURL := scheme + "://" + host + "/v1/chat/completions"
 
