@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	githubauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/github"
@@ -42,11 +41,6 @@ import (
 // retries once on 401 in case the token was revoked early.
 type GitHubCopilotExecutor struct {
 	cfg *config.Config
-
-	// copilotMu serializes Copilot-token exchanges per credential so
-	// concurrent requests against the same auth do not stampede GitHub.
-	// Keyed by auth.ID. The zero value (sync.Map) is usable.
-	copilotMu sync.Map
 }
 
 // NewGitHubCopilotExecutor builds the executor with a config reference.
@@ -120,108 +114,18 @@ func extractClientInitiator(reqHeaders http.Header) string {
 }
 
 // ensureCopilotToken returns a valid Copilot bearer token for the
-// credential, exchanging a new one if the cached token is missing or
-// expiring soon. The exchange is serialized per auth.ID so concurrent
-// requests do not each hit /copilot_internal/v2/token.
-//
-// Returns the fresh token and, when an exchange happened, writes the new
-// token back into auth.Metadata so subsequent requests see it. Callers
-// must treat auth as mutable.
+// credential. The two-layer exchange/refresh logic lives in
+// internal/auth/github/refresh_helper.go so management quota handlers can
+// reuse it without depending on this executor.
 func (e *GitHubCopilotExecutor) ensureCopilotToken(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
-	if auth == nil || auth.Metadata == nil {
-		return "", fmt.Errorf("github copilot: nil auth/metadata")
+	if auth == nil {
+		return "", fmt.Errorf("github copilot: nil auth")
 	}
-	cached, _ := auth.Metadata["copilot_token"].(string)
-	expAny := auth.Metadata["copilot_expires_at"]
-	var expUnix int64
-	switch v := expAny.(type) {
-	case int64:
-		expUnix = v
-	case float64:
-		expUnix = int64(v)
-	case int:
-		expUnix = int64(v)
-	}
-	if cached != "" && expUnix > time.Now().Unix()+githubCopilotRefreshSkew {
-		return cached, nil
-	}
-	// Need an exchange. Serialize per auth to avoid stampedes.
-	muAny, _ := e.copilotMu.LoadOrStore(auth.ID, &sync.Mutex{})
-	mu := muAny.(*sync.Mutex)
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Re-check under the lock — another goroutine may have refreshed.
-	cached, _ = auth.Metadata["copilot_token"].(string)
-	expAny = auth.Metadata["copilot_expires_at"]
-	switch v := expAny.(type) {
-	case int64:
-		expUnix = v
-	case float64:
-		expUnix = int64(v)
-	case int:
-		expUnix = int64(v)
-	}
-	if cached != "" && expUnix > time.Now().Unix()+githubCopilotRefreshSkew {
-		return cached, nil
-	}
-
-	accessToken, _ := auth.Metadata["access_token"].(string)
-	if accessToken == "" {
-		return "", &cliproxyauth.Error{
-			HTTPStatus: http.StatusUnauthorized,
-			Message:    "github copilot: missing access_token in credential metadata",
-		}
-	}
-
-	// Layer 1 — exchange the existing GitHub access token for a Copilot
-	// bearer token. This is the happy path: GitHub access tokens never
-	// expire on classic OAuth apps, and on refresh-enabled apps the
-	// access token is typically still valid on Copilot-token exchange.
-	resp, err := githubauth.ExchangeCopilotToken(ctx, accessToken)
-	if err == nil {
-		auth.Metadata["copilot_token"] = resp.Token
-		auth.Metadata["copilot_expires_at"] = resp.ExpiresAt
-		if resp.Endpoints != nil {
-			auth.Metadata["copilot_endpoints"] = resp.Endpoints
-		}
-		return resp.Token, nil
-	}
-
-	// Layer 2 — if Layer 1 failed AND we have a refresh_token (GitHub
-	// OAuth apps issued after 2022 or enterprise apps), refresh the
-	// GitHub access token first, then retry the Copilot exchange. This
-	// mirrors OmniRoute's github.ts:200-217 fallback.
-	//
-	// If there is no refresh_token we cannot recover here — surface the
-	// original error so the scheduler can mark the credential unavailable.
-	refreshToken, _ := auth.Metadata["refresh_token"].(string)
-	if refreshToken == "" {
-		return "", fmt.Errorf("github copilot: exchange token: %w", err)
-	}
-	clientID, _ := auth.Metadata["client_id"].(string)
-	clientSecret, _ := auth.Metadata["client_secret"].(string)
-	refreshed, refreshErr := githubauth.RefreshGitHubToken(ctx, clientID, clientSecret, refreshToken)
-	if refreshErr != nil {
-		return "", fmt.Errorf("github copilot: refresh failed after exchange error %v: %w", err, refreshErr)
-	}
-	auth.Metadata["access_token"] = refreshed.AccessToken
-	if rotated := strings.TrimSpace(refreshed.RefreshToken); rotated != "" {
-		// Rotate the refresh token when the server issued a new one.
-		// Losing this rotation bricks future refreshes.
-		auth.Metadata["refresh_token"] = rotated
-	}
-	// Retry Layer 1 with the fresh access token.
-	resp, err = githubauth.ExchangeCopilotToken(ctx, refreshed.AccessToken)
+	res, err := githubauth.EnsureCopilotToken(ctx, auth.ID, auth.Metadata)
 	if err != nil {
-		return "", fmt.Errorf("github copilot: exchange after refresh: %w", err)
+		return "", err
 	}
-	auth.Metadata["copilot_token"] = resp.Token
-	auth.Metadata["copilot_expires_at"] = resp.ExpiresAt
-	if resp.Endpoints != nil {
-		auth.Metadata["copilot_endpoints"] = resp.Endpoints
-	}
-	return resp.Token, nil
+	return res.CopilotToken, nil
 }
 
 // copilotChatURL returns the full chat-completions URL. Some Copilot

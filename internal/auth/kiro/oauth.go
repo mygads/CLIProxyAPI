@@ -74,7 +74,22 @@ const (
 	// that does not start with this prefix when the operator pastes one
 	// into the management UI.
 	ImportedTokenPrefix = "aorAAAAAG"
+
+	// CodeWhispererEndpointTemplate is the regional CodeWhisperer host. The
+	// quota probe (AmazonCodeWhispererService.ListAvailableModels) is a
+	// POST to the bare host, while chat (generateAssistantResponse) lives
+	// at /generateAssistantResponse on the same host.
+	CodeWhispererEndpointTemplate = "https://codewhisperer.%s.amazonaws.com"
 )
+
+// CodeWhispererBaseURL builds the CodeWhisperer base URL for a region.
+// Pass an empty string to fall back to DefaultRegion.
+func CodeWhispererBaseURL(region string) string {
+	if strings.TrimSpace(region) == "" {
+		region = DefaultRegion
+	}
+	return fmt.Sprintf(CodeWhispererEndpointTemplate, region)
+}
 
 // SSOScopes is the scope list expected by the SSO OIDC registerClient
 // call. Exposed as a slice so callers can feed it straight into a JSON

@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
@@ -45,11 +44,6 @@ import (
 // The narrow path gets us end-to-end traffic through the decoder today.
 type KiroExecutor struct {
 	cfg *config.Config
-
-	// refreshMu serializes Refresh() per credential. Kiro's /refreshToken
-	// will issue a new refresh token on some calls, and parallel refreshes
-	// would race on which token survives.
-	refreshMu sync.Map
 }
 
 // NewKiroExecutor builds the executor. The config is used for proxy-aware
@@ -95,130 +89,18 @@ func kiroHeaders(accessToken string) http.Header {
 }
 
 // ensureAccessToken returns a valid Kiro access token, refreshing when
-// the cached one is past its `expired` field. Serialized per auth.ID to
-// avoid parallel refreshes racing on the rotated refresh_token.
+// the cached one is past its `expired` field. Refresh logic lives in
+// internal/auth/kiro/refresh_helper.go so management quota handlers can
+// reuse the same code path without depending on this executor.
 func (e *KiroExecutor) ensureAccessToken(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
-	if auth == nil || auth.Metadata == nil {
-		return "", fmt.Errorf("kiro: nil auth/metadata")
+	if auth == nil {
+		return "", fmt.Errorf("kiro: nil auth")
 	}
-	accessToken, _ := auth.Metadata["access_token"].(string)
-	var expUnix int64
-	switch v := auth.Metadata["expires_at"].(type) {
-	case int64:
-		expUnix = v
-	case float64:
-		expUnix = int64(v)
-	case int:
-		expUnix = int64(v)
-	}
-	// 60-second skew: rotate early rather than race the clock.
-	if accessToken != "" && expUnix > time.Now().Unix()+60 {
-		return accessToken, nil
-	}
-	muAny, _ := e.refreshMu.LoadOrStore(auth.ID, &sync.Mutex{})
-	mu := muAny.(*sync.Mutex)
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Re-check under lock.
-	accessToken, _ = auth.Metadata["access_token"].(string)
-	switch v := auth.Metadata["expires_at"].(type) {
-	case int64:
-		expUnix = v
-	case float64:
-		expUnix = int64(v)
-	case int:
-		expUnix = int64(v)
-	}
-	if accessToken != "" && expUnix > time.Now().Unix()+60 {
-		return accessToken, nil
-	}
-
-	refreshToken, _ := auth.Metadata["refresh_token"].(string)
-	if refreshToken == "" {
-		return "", &cliproxyauth.Error{
-			HTTPStatus: http.StatusUnauthorized,
-			Message:    "kiro: missing refresh_token in credential metadata; user must log in again",
-		}
-	}
-
-	// Two refresh paths, in priority order:
-	//
-	//  1. SSO OIDC (AWS Identity Center) when the credential was minted by
-	//     the device-code flow — providerSpecificData carries a clientId +
-	//     clientSecret from a prior registerClient call. This hits
-	//     oidc.<region>.amazonaws.com/token.
-	//  2. Social auth fallback — just the refresh_token, POSTed to
-	//     auth.desktop.kiro.dev/refreshToken. This is the default desktop-
-	//     Kiro flow and the only one exposed by our browser login today.
-	//
-	// The two responses have overlapping but not identical shapes, so we
-	// normalize them both into the same Metadata fields.
-	ssoClientID, _ := readNestedString(auth.Metadata, "provider_specific_data", "clientId")
-	ssoClientSecret, _ := readNestedString(auth.Metadata, "provider_specific_data", "clientSecret")
-	region, _ := auth.Metadata["region"].(string)
-	if ssoClientID != "" && ssoClientSecret != "" {
-		ssoResp, err := kiroauth.RefreshSSO(ctx, region, ssoClientID, ssoClientSecret, refreshToken)
-		if err != nil {
-			return "", fmt.Errorf("kiro: sso refresh: %w", err)
-		}
-		auth.Metadata["access_token"] = ssoResp.AccessToken
-		// ExpiresIn is seconds-from-now; translate to absolute.
-		if ssoResp.ExpiresIn > 0 {
-			auth.Metadata["expires_at"] = time.Now().Unix() + ssoResp.ExpiresIn
-		}
-		if rotated := strings.TrimSpace(ssoResp.RefreshToken); rotated != "" {
-			auth.Metadata["refresh_token"] = rotated
-		}
-		return ssoResp.AccessToken, nil
-	}
-
-	resp, err := kiroauth.Refresh(ctx, refreshToken)
+	res, err := kiroauth.RefreshIfExpired(ctx, auth.ID, auth.Metadata)
 	if err != nil {
-		return "", fmt.Errorf("kiro: refresh: %w", err)
+		return "", err
 	}
-	auth.Metadata["access_token"] = resp.AccessToken
-	auth.Metadata["expires_at"] = resp.ExpiresAt
-	if rotated := strings.TrimSpace(resp.RefreshToken); rotated != "" {
-		auth.Metadata["refresh_token"] = rotated
-	}
-	if resp.Region != "" {
-		auth.Metadata["region"] = resp.Region
-	}
-	if resp.ProfileArn != "" {
-		auth.Metadata["profile_arn"] = resp.ProfileArn
-	}
-	return resp.AccessToken, nil
-}
-
-// readNestedString walks a map[string]any by key path. Returns the string
-// value and true only if every intermediate step is a map and the leaf is
-// a non-empty string. Used for providerSpecificData.clientId / clientSecret
-// which the management layer stores as a nested map to mirror OmniRoute.
-func readNestedString(root map[string]any, keys ...string) (string, bool) {
-	if len(keys) == 0 {
-		return "", false
-	}
-	var cur any = root
-	for i, k := range keys {
-		m, ok := cur.(map[string]any)
-		if !ok {
-			return "", false
-		}
-		v, exists := m[k]
-		if !exists {
-			return "", false
-		}
-		if i == len(keys)-1 {
-			s, ok := v.(string)
-			if !ok || strings.TrimSpace(s) == "" {
-				return "", false
-			}
-			return s, true
-		}
-		cur = v
-	}
-	return "", false
+	return res.AccessToken, nil
 }
 
 // buildKiroPayload converts an OpenAI-format request to CodeWhisperer's

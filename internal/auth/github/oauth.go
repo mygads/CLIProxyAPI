@@ -26,6 +26,13 @@ const (
 	RefreshGrantType       = "refresh_token"
 	CopilotTokenExchangeURL = "https://api.github.com/copilot_internal/v2/token"
 	UserInfoURL             = "https://api.github.com/user"
+	// CopilotInternalUserURL is the quota/usage endpoint VS Code's Copilot
+	// extension polls to render the user's plan + remaining-call badges.
+	// Auth scheme is "Bearer <copilot_token>" (NOT "token <gho_...>"); the
+	// shape varies between paid (`quota_snapshots`) and free (`monthly_quotas`)
+	// plans — both are handled by the management quota handler. See OmniRoute
+	// lib/usage/fetcher.ts:78-129 for the canonical reader.
+	CopilotInternalUserURL = "https://api.github.com/copilot_internal/user"
 
 	// APIVersion is the X-Github-Api-Version header Copilot clients send.
 	APIVersion = "2025-04-01"

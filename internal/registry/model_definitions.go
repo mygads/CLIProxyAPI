@@ -97,18 +97,30 @@ func GetGitHubCopilotModels() []*ModelInfo {
 	}
 }
 
-// GetKiroModels returns the Kiro (CodeWhisperer) model catalog. Model IDs
-// mirror OmniRoute's providerRegistry.ts `kiro` block (2026-05). The
-// model string is forwarded unchanged into the CodeWhisperer request body
+// GetKiroModels returns the Kiro (CodeWhisperer) model catalog. The full
+// list is sourced live from `AmazonCodeWhispererService.ListAvailableModels`
+// (see internal/api/handlers/management/kiro_quota.go); this static list is
+// the fallback used when the dynamic fetch is not available — for example
+// during /v1/models requests that arrive before the credential has been
+// probed. Keep it in sync with the upstream catalog observed on
+// 2026-05-15. The model string is forwarded unchanged into CodeWhisperer
 // as currentMessage.userInputMessage.modelId — do not canonicalize dots
 // to dashes or the upstream returns ValidationException.
 func GetKiroModels() []*ModelInfo {
 	return []*ModelInfo{
+		{ID: "auto", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Auto (Server Picks)"},
 		{ID: "claude-opus-4.7", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Claude Opus 4.7"},
 		{ID: "claude-opus-4.6", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Claude Opus 4.6"},
 		{ID: "claude-sonnet-4.6", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Claude Sonnet 4.6"},
+		{ID: "claude-opus-4.5", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Claude Opus 4.5"},
 		{ID: "claude-sonnet-4.5", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Claude Sonnet 4.5"},
+		{ID: "claude-sonnet-4", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Claude Sonnet 4"},
 		{ID: "claude-haiku-4.5", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Claude Haiku 4.5"},
+		{ID: "deepseek-3.2", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "DeepSeek v3.2"},
+		{ID: "minimax-m2.5", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "MiniMax M2.5"},
+		{ID: "minimax-m2.1", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "MiniMax M2.1"},
+		{ID: "glm-5", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "GLM 5"},
+		{ID: "qwen3-coder-next", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Qwen3 Coder Next"},
 	}
 }
 

@@ -262,6 +262,20 @@ func (h *Handler) resolveTokenForAuth(ctx context.Context, auth *coreauth.Auth) 
 		token, errToken := h.refreshAntigravityOAuthAccessToken(ctx, auth)
 		return token, errToken
 	}
+	// Kiro and GitHub Copilot tokens expire on the order of an hour /
+	// thirty minutes. The executor refreshes them on use, but the
+	// management /api-call path used by the UI only sees the cached
+	// metadata.access_token. Mirror the executor's refresh-on-demand here
+	// (and persist rotated fields to disk) so $TOKEN$ substitution always
+	// hands back a live credential.
+	if provider == "kiro" {
+		token, errToken := h.refreshKiroAccessTokenForAuth(ctx, auth)
+		return token, errToken
+	}
+	if provider == "github" {
+		token, errToken := h.refreshGithubCopilotTokenForAuth(ctx, auth)
+		return token, errToken
+	}
 
 	return tokenValueForAuth(auth), nil
 }
