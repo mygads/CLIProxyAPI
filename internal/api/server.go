@@ -869,6 +869,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/github-auth-url", s.mgmt.RequestGitHubToken)
 		mgmt.GET("/github-quota", s.mgmt.GetGithubQuota)
 		mgmt.GET("/kiro-auth-url", s.mgmt.RequestKiroToken)
+		mgmt.GET("/kiro-device-auth", s.mgmt.RequestKiroDeviceAuth)
 		mgmt.GET("/kiro-quota", s.mgmt.GetKiroQuota)
 		mgmt.POST("/kiro-import-token", s.mgmt.ImportKiroToken)
 		mgmt.GET("/qwen-auth-url", s.mgmt.RequestQwenToken)

@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -327,6 +328,172 @@ func (h *Handler) ImportKiroToken(c *gin.Context) {
 		"label":  label,
 		"email":  refreshResp.Email,
 	})
+}
+
+// RequestKiroDeviceAuth starts an AWS Builder ID device-code flow for
+// Kiro. Mirrors RequestGitHubToken structurally:
+//
+//   1. RegisterSSOClient → get a fresh OIDC clientId/clientSecret pair.
+//   2. StartSSODeviceAuthorization → get user_code + verification URL.
+//   3. Spawn a goroutine that polls /token until AWS returns tokens or
+//      the 10-minute deadline elapses.
+//   4. On success, persist a KiroTokenStorage with auth_method="builder-id"
+//      AND provider_specific_data.{clientId,clientSecret,region,startUrl}
+//      so RefreshIfExpired can rotate via the SSO /token endpoint.
+//
+// This replaces the broken browser-login URL flow that the legacy
+// /kiro-auth-url endpoint emits — that URL is for Kiro IDE's desktop
+// app callback (kiro://...) and rejects browser opens with a Cognito
+// PKCE validation error.
+func (h *Handler) RequestKiroDeviceAuth(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	region := kiroauth.DefaultRegion
+	startURL := kiroauth.SSOStartURL
+
+	registered, err := kiroauth.RegisterSSOClient(ctx, region)
+	if err != nil {
+		log.Errorf("kiro device auth: register client: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("AWS SSO client registration failed: %v", err)})
+		return
+	}
+
+	device, err := kiroauth.StartSSODeviceAuthorization(ctx, region, registered.ClientID, registered.ClientSecret, startURL)
+	if err != nil {
+		log.Errorf("kiro device auth: start authorization: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("AWS SSO device authorization failed: %v", err)})
+		return
+	}
+
+	state := fmt.Sprintf("kr-%d", time.Now().UnixNano())
+	RegisterOAuthSession(state, "kiro")
+
+	go func() {
+		// 10-minute deadline matches the GitHub flow. AWS device codes
+		// typically expire in 5–10 min; we honor the server-supplied
+		// expires_in if it's tighter.
+		timeout := 10 * time.Minute
+		if device.ExpiresIn > 0 && time.Duration(device.ExpiresIn)*time.Second < timeout {
+			timeout = time.Duration(device.ExpiresIn) * time.Second
+		}
+		pollCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
+		interval := time.Duration(device.Interval) * time.Second
+		if interval < time.Second {
+			interval = 5 * time.Second
+		}
+
+		var tokenResp *kiroauth.SSODeviceTokenResponse
+		for {
+			select {
+			case <-pollCtx.Done():
+				SetOAuthSessionError(state, "device authorization timed out — restart the login flow")
+				return
+			case <-time.After(interval):
+			}
+
+			resp, pollErr := kiroauth.PollSSODeviceToken(pollCtx, region, registered.ClientID, registered.ClientSecret, device.DeviceCode)
+			if pollErr == nil && resp != nil && resp.AccessToken != "" {
+				tokenResp = resp
+				break
+			}
+			// Sentinel errors → keep polling. Other errors → terminal.
+			if errors.Is(pollErr, kiroauth.ErrSSODeviceAuthPending) {
+				continue
+			}
+			if errors.Is(pollErr, kiroauth.ErrSSODeviceAuthSlowDown) {
+				// AWS asks us to back off by the device interval. Bump
+				// the cadence by 5s as the spec recommends.
+				interval += 5 * time.Second
+				continue
+			}
+			SetOAuthSessionError(state, fmt.Sprintf("authorization failed: %v", pollErr))
+			return
+		}
+
+		// Build storage. Builder-ID-minted credentials carry their
+		// {clientId,clientSecret,region,startUrl} in metadata so the
+		// refresh helper can rotate via SSO /token instead of the
+		// social-auth /refreshToken endpoint.
+		now := time.Now()
+		expiresAt := int64(0)
+		if tokenResp.ExpiresIn > 0 {
+			expiresAt = now.Unix() + tokenResp.ExpiresIn
+		}
+
+		storage := &kiroauth.KiroTokenStorage{
+			AccessToken:  tokenResp.AccessToken,
+			RefreshToken: strings.TrimSpace(tokenResp.RefreshToken),
+			Expire:       expiresAt,
+			Region:       region,
+			Type:         "kiro",
+			AuthMethod:   "builder-id",
+			LastRefresh:  now.UTC().Format(time.RFC3339),
+		}
+
+		metadata := map[string]any{
+			"type":          "kiro",
+			"access_token":  tokenResp.AccessToken,
+			"refresh_token": strings.TrimSpace(tokenResp.RefreshToken),
+			"expires_at":    expiresAt,
+			"region":        region,
+			"auth_method":   "builder-id",
+			"timestamp":     now.UnixMilli(),
+			"provider_specific_data": map[string]any{
+				"clientId":     registered.ClientID,
+				"clientSecret": registered.ClientSecret,
+				"region":       region,
+				"startUrl":     startURL,
+				"authMethod":   "builder-id",
+			},
+		}
+
+		label := "Kiro AI (Builder ID)"
+
+		fileName := fmt.Sprintf("kiro-%d.json", now.UnixMilli())
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: "kiro",
+			FileName: fileName,
+			Label:    label,
+			Storage:  storage,
+			Metadata: metadata,
+		}
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Errorf("save kiro device-auth token: %v", errSave)
+			SetOAuthSessionError(state, "failed to persist tokens")
+			return
+		}
+		log.Infof("Kiro Builder ID credential saved to %s", savedPath)
+		CompleteOAuthSession(state)
+		CompleteOAuthSessionsByProvider("kiro")
+	}()
+
+	// Tell the FE to render the device-code block (user_code + URL).
+	// The shape mirrors what RequestGitHubToken returns so the existing
+	// DEVICE_CODE_PROVIDERS rendering works without further changes.
+	c.JSON(http.StatusOK, gin.H{
+		"status":           "ok",
+		"url":              firstNonEmpty(device.VerificationURIComplete, device.VerificationURI),
+		"verification_uri": device.VerificationURI,
+		"user_code":        device.UserCode,
+		"state":            state,
+		"expires_in":       device.ExpiresIn,
+		"interval":         device.Interval,
+	})
+}
+
+// firstNonEmpty returns the first non-empty trimmed string from values.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // waitForPendingOAuthCallback polls the auth directory for the callback

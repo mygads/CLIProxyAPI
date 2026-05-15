@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -238,6 +239,252 @@ func RefreshSSO(ctx context.Context, region, clientID, clientSecret, refreshToke
 // LoginURL builds the browser URL users open to start a Kiro login flow.
 // The state parameter is echoed back in the redirect so the local
 // callback server can match responses to sessions.
+//
+// DEPRECATED — this URL only works for Kiro IDE's desktop app callback
+// (kiro://...) and rejects browser opens with a 4-validation-errors
+// response. The supported flow is now AWS Builder ID device-code; see
+// RegisterSSOClient + StartSSODeviceAuthorization + PollSSODeviceToken.
+// Kept for backward compat with the legacy /kiro-auth-url endpoint.
 func LoginURL(state string) string {
 	return fmt.Sprintf("%s?state=%s", LoginStartURL, state)
+}
+
+// SSORegisterClientResponse is the AWS SSO OIDC /client/register reply.
+// We only consume clientId + clientSecret; the rest is logged for debug
+// when AWS rotates the secret early (rare, but happens for misconfigured
+// issuerUrl).
+type SSORegisterClientResponse struct {
+	ClientID                string `json:"clientId"`
+	ClientSecret            string `json:"clientSecret"`
+	ClientIDIssuedAt        int64  `json:"clientIdIssuedAt,omitempty"`
+	ClientSecretExpiresAt   int64  `json:"clientSecretExpiresAt,omitempty"`
+}
+
+// RegisterSSOClient registers a public OIDC client with AWS SSO so a
+// device-code flow can be started. Mirrors 9router's
+// KiroService.registerClient (lib/oauth/services/kiro.js:19) and is the
+// counterpart to github.StartDeviceFlow's bake-in client_id — AWS does
+// not let you hard-code the OIDC client, so we register a fresh one per
+// auth attempt and persist {clientId, clientSecret} alongside the
+// refresh_token so RefreshSSO can rotate the access token later.
+func RegisterSSOClient(ctx context.Context, region string) (*SSORegisterClientResponse, error) {
+	region = strings.TrimSpace(region)
+	if region == "" {
+		region = DefaultRegion
+	}
+	endpoint := fmt.Sprintf(SSORegisterClientURLTpl, region)
+
+	body, err := json.Marshal(map[string]any{
+		"clientName": SSOClientName,
+		"clientType": SSOClientType,
+		"scopes":     SSOScopes,
+		"grantTypes": []string{SSOGrantTypeDeviceCode, SSOGrantTypeRefresh},
+		"issuerUrl":  SSOIssuerURL,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("kiro sso register: encode: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("kiro sso register: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", UserAgent)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("kiro sso register: do: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		// Preserve the upstream error body so operators can see why AWS
+		// rejected the registration (most often: bad issuerUrl).
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("kiro sso register: status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	var out SSORegisterClientResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("kiro sso register: decode: %w", err)
+	}
+	if out.ClientID == "" || out.ClientSecret == "" {
+		return nil, fmt.Errorf("kiro sso register: empty clientId/clientSecret in response")
+	}
+	return &out, nil
+}
+
+// SSODeviceAuthorizationResponse models POST /device_authorization. The
+// fields mirror the RFC 8628 shape; verificationUriComplete is the
+// "polished" URL with the user_code already embedded so the operator can
+// open it in a browser without typing the code separately.
+type SSODeviceAuthorizationResponse struct {
+	DeviceCode              string `json:"deviceCode"`
+	UserCode                string `json:"userCode"`
+	VerificationURI         string `json:"verificationUri"`
+	VerificationURIComplete string `json:"verificationUriComplete"`
+	ExpiresIn               int    `json:"expiresIn"`
+	Interval                int    `json:"interval"`
+}
+
+// StartSSODeviceAuthorization opens an AWS Builder ID / IDC device-code
+// flow. clientID + clientSecret come from RegisterSSOClient; startUrl
+// is `https://view.awsapps.com/start` for Builder ID, or a tenant-specific
+// URL for IDC. Returns the user_code + verification URL the operator
+// must visit, plus the device_code that PollSSODeviceToken polls with.
+func StartSSODeviceAuthorization(ctx context.Context, region, clientID, clientSecret, startUrl string) (*SSODeviceAuthorizationResponse, error) {
+	clientID = strings.TrimSpace(clientID)
+	clientSecret = strings.TrimSpace(clientSecret)
+	if clientID == "" || clientSecret == "" {
+		return nil, fmt.Errorf("kiro sso device auth: missing clientId/clientSecret")
+	}
+	region = strings.TrimSpace(region)
+	if region == "" {
+		region = DefaultRegion
+	}
+	if strings.TrimSpace(startUrl) == "" {
+		startUrl = SSOStartURL
+	}
+	endpoint := fmt.Sprintf(SSODeviceAuthURLTpl, region)
+
+	body, err := json.Marshal(map[string]string{
+		"clientId":     clientID,
+		"clientSecret": clientSecret,
+		"startUrl":     startUrl,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("kiro sso device auth: encode: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("kiro sso device auth: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", UserAgent)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("kiro sso device auth: do: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("kiro sso device auth: status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	var out SSODeviceAuthorizationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("kiro sso device auth: decode: %w", err)
+	}
+	if out.DeviceCode == "" || out.UserCode == "" {
+		return nil, fmt.Errorf("kiro sso device auth: empty deviceCode/userCode")
+	}
+	if out.Interval <= 0 {
+		out.Interval = 5
+	}
+	return &out, nil
+}
+
+// SSODeviceTokenResponse models the AWS SSO OIDC /token reply for a
+// device-code grant. Mirrors SSORefreshResponse but adds idToken which
+// AWS sometimes returns for first-time grants.
+type SSODeviceTokenResponse struct {
+	AccessToken  string `json:"accessToken"`
+	RefreshToken string `json:"refreshToken,omitempty"`
+	TokenType    string `json:"tokenType,omitempty"`
+	ExpiresIn    int64  `json:"expiresIn,omitempty"`
+	IDToken      string `json:"idToken,omitempty"`
+	// Error fields when AWS returns 400 with a typed body. We surface
+	// authorization_pending / slow_down to the caller via a sentinel.
+	Error            string `json:"error,omitempty"`
+	ErrorDescription string `json:"error_description,omitempty"`
+}
+
+// SSODeviceAuthPending and SSODeviceAuthSlowDown are sentinel errors
+// returned by PollSSODeviceToken when AWS asks the caller to keep
+// polling. The caller should sleep `interval` (or `interval` + a small
+// bump on slow_down) and try again, NOT abort.
+var (
+	ErrSSODeviceAuthPending  = fmt.Errorf("kiro sso device token: authorization_pending")
+	ErrSSODeviceAuthSlowDown = fmt.Errorf("kiro sso device token: slow_down")
+)
+
+// PollSSODeviceToken issues one /token poll for a device-code grant.
+// Returns:
+//   - tokens, nil          → operator approved; persist these.
+//   - nil, ErrSSODeviceAuthPending  → keep polling at `interval`.
+//   - nil, ErrSSODeviceAuthSlowDown → keep polling but bump `interval` by 5s.
+//   - nil, other error     → terminal failure (expired_token, access_denied, etc).
+//
+// The caller owns the polling loop because timing semantics differ between
+// callers (mgmt handler uses a 10-min ctx; CLI tools may want shorter).
+func PollSSODeviceToken(ctx context.Context, region, clientID, clientSecret, deviceCode string) (*SSODeviceTokenResponse, error) {
+	clientID = strings.TrimSpace(clientID)
+	clientSecret = strings.TrimSpace(clientSecret)
+	deviceCode = strings.TrimSpace(deviceCode)
+	if clientID == "" || clientSecret == "" || deviceCode == "" {
+		return nil, fmt.Errorf("kiro sso device token: missing clientId/clientSecret/deviceCode")
+	}
+	region = strings.TrimSpace(region)
+	if region == "" {
+		region = DefaultRegion
+	}
+	endpoint := fmt.Sprintf(SSOTokenURLTpl, region)
+
+	body, err := json.Marshal(map[string]string{
+		"clientId":     clientID,
+		"clientSecret": clientSecret,
+		"deviceCode":   deviceCode,
+		"grantType":    SSOGrantTypeDeviceCode,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("kiro sso device token: encode: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("kiro sso device token: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", UserAgent)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("kiro sso device token: do: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var out SSODeviceTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("kiro sso device token: decode: %w", err)
+	}
+
+	// AWS returns 400 with a typed `error` for authorization_pending /
+	// slow_down / expired_token / access_denied. The caller picks
+	// "retry" vs "abort" via the sentinel errors above.
+	if out.AccessToken != "" {
+		return &out, nil
+	}
+	switch out.Error {
+	case "authorization_pending":
+		return nil, ErrSSODeviceAuthPending
+	case "slow_down":
+		return nil, ErrSSODeviceAuthSlowDown
+	case "expired_token":
+		return nil, fmt.Errorf("kiro sso device token: device code expired, restart the login flow")
+	case "access_denied":
+		return nil, fmt.Errorf("kiro sso device token: user denied the authorization request")
+	case "":
+		return nil, fmt.Errorf("kiro sso device token: empty access_token without error (status %d)", resp.StatusCode)
+	default:
+		desc := out.ErrorDescription
+		if desc == "" {
+			desc = out.Error
+		}
+		return nil, fmt.Errorf("kiro sso device token: %s: %s", out.Error, desc)
+	}
 }

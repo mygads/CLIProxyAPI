@@ -55,6 +55,16 @@ type KiroTokenStorage struct {
 	// admin UI displays it to let operators tell credentials apart.
 	Email string `json:"email,omitempty"`
 
+	// AuthMethod records which login flow minted this credential. Values:
+	//   "builder-id" — AWS Builder ID device-code (default for new logins)
+	//   "idc"        — IAM Identity Center device-code with custom startUrl
+	//   "social"     — legacy Google/GitHub Cognito flow (browser redirect)
+	//   "imported"   — operator pasted a refresh token directly
+	// Used by the management UI to label credentials and by the executor
+	// to pick the right refresh path. Empty value on legacy files defaults
+	// to "social" semantics (refresh via auth.desktop.kiro.dev/refreshToken).
+	AuthMethod string `json:"auth_method,omitempty"`
+
 	// LastRefresh is RFC3339 timestamp of the most recent refresh. Mirrors
 	// the other provider storages.
 	LastRefresh string `json:"last_refresh,omitempty"`
