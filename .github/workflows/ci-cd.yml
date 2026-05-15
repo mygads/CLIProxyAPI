@@ -1,6 +1,15 @@
-﻿# ===================================================================================
+# ===================================================================================
 # CLI Proxy API (ai-core2) - CI/CD PIPELINE
 # ===================================================================================
+#
+# Mengikuti pattern vps-deployment (lihat docs/CICD-DEPLOYMENT.md di repo
+# vps-deployment): build → push GHCR → SSH deploy via appleboy/ssh-action.
+#
+# Container baca config dari S3 (Cloudflare R2) saat startup pakai
+# OBJECTSTORE_* env, jadi WORKFLOW TIDAK menulis config.yaml lagi —
+# .env adalah satu-satunya secret yang dipush per deploy. Ini menyamakan
+# alur dengan repo Genfity lainnya (lihat genfity-app, genfity-order-main).
+
 name: CI/CD Pipeline
 
 on:
@@ -20,6 +29,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/cli-proxy-api
+  APP_DIR: /home/cicddeploy/genfity/ai-core2
 
 jobs:
   build:
@@ -29,7 +39,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-
     steps:
       - uses: actions/checkout@v4
 
@@ -40,8 +49,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GHCR_TOKEN || github.token }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
 
       - name: Extract metadata
         id: meta
@@ -75,167 +84,64 @@ jobs:
     permissions:
       contents: read
       packages: read
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            cd ${{ env.APP_DIR }}
 
-      - name: Setup SSH
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
-        run: |
-          if [ -z "$VPS_HOST" ]; then
-            echo "❌ VPS_HOST secret is empty or not set"
-            exit 1
-          fi
-          if [ -z "$VPS_SSH_KEY" ]; then
-            echo "❌ VPS_SSH_KEY secret is empty or not set"
-            exit 1
-          fi
-          mkdir -p ~/.ssh
-          printf '%s' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          # ssh-keyscan can fail transiently; retry up to 3 times
-          for i in 1 2 3; do
-            if ssh-keyscan -H -T 10 "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null; then
-              break
-            fi
-            echo "⚠️ ssh-keyscan attempt $i failed, retrying..."
-            sleep 5
-          done
-          if [ ! -s ~/.ssh/known_hosts ]; then
-            echo "❌ ssh-keyscan failed after 3 attempts — VPS may be unreachable"
-            exit 1
-          fi
-          printf 'Host *\n  ServerAliveInterval 60\n  ServerAliveCountMax 10\n' >> ~/.ssh/config
+            # Sync repository — keep working tree aligned with main so
+            # docker-compose.yml + Dockerfile updates flow through automatically.
+            git fetch origin main
+            git reset --hard origin/main
 
-      - name: Verify secrets
-        run: |
-          echo "  - VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY && 'Set' || 'Not set' }}"
-          echo "  - GHCR_TOKEN: ${{ secrets.GHCR_TOKEN && 'Set' || 'Not set' }}"
-          echo "  - ENV_FILE: ${{ secrets.ENV_FILE && 'Set' || 'Not set' }}"
-          echo "  - CONFIG_YAML: ${{ secrets.CONFIG_YAML && 'Set' || 'Not set' }}"
+            # Full .env replacement from secret (matches Genfity convention).
+            # Container reads OBJECTSTORE_* from .env at startup and pulls
+            # config.yaml from R2; no separate CONFIG_YAML secret needed.
+            cat > .env << 'ENVEOF'
+            ${{ secrets.ENV_FILE }}
+            ENVEOF
+            chmod 600 .env
 
-      - name: Update ENV and CONFIG files on server
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-          ENV_FILE: ${{ secrets.ENV_FILE }}
-          CONFIG_YAML: ${{ secrets.CONFIG_YAML }}
-        run: |
-          if [ -n "$ENV_FILE" ]; then
-            echo "Updating .env file on server..."
-            printf '%s' "$ENV_FILE" | ssh $VPS_USER@$VPS_HOST "mkdir -p /home/$VPS_USER/genfity/ai-core2 && cat > /tmp/cliproxy.env && sudo install -m 600 -o root -g root /tmp/cliproxy.env /home/$VPS_USER/genfity/ai-core2/.env && rm -f /tmp/cliproxy.env"
-          fi
-          if [ -n "$CONFIG_YAML" ]; then
-            echo "Checking config.yaml on server..."
-            ssh $VPS_USER@$VPS_HOST "
-              if [ ! -f /home/$VPS_USER/genfity/ai-core2/config.yaml ]; then
-                echo 'config.yaml not found, writing initial config...'
-                cat > /tmp/cliproxy.yaml
-                sudo install -m 600 -o root -g root /tmp/cliproxy.yaml /home/$VPS_USER/genfity/ai-core2/config.yaml
-                rm -f /tmp/cliproxy.yaml
-              else
-                echo 'config.yaml already exists, skipping overwrite (managed via Management API)'
-                cat > /dev/null
-              fi
-            " <<< "$CONFIG_YAML"
-          fi
+            # Login to GHCR so docker compose pull can fetch the freshly
+            # pushed image.
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u mygads --password-stdin
 
-      - name: Deploy with Docker Compose
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
-        run: |
-          set -euo pipefail
-          echo "Deploying CLI Proxy API with docker compose..."
+            # Pull latest image and recreate the container.
+            docker compose pull cli-proxy-api
+            docker compose up -d --force-recreate cli-proxy-api
 
-          ssh $VPS_USER@$VPS_HOST << ENDSSH
-            set -euo pipefail
-            mkdir -p ~/genfity/ai-core2
-            cd ~/genfity/ai-core2
-
-            if [ -d .git ]; then
-              # Fix ownership of files that Docker may have created as root
-              sudo chown -R $(whoami):$(whoami) .
-              # Force pull latest changes (override local, no conflicts)
-              git remote set-url origin https://x-access-token:${GHCR_TOKEN}@github.com/${{ github.repository }}.git
-              git fetch origin main
-              git reset --hard origin/main
-              git remote set-url origin https://github.com/${{ github.repository }}.git
-            elif [ -f docker-compose.yml ]; then
-              echo "Deploy directory is not a git repository; initializing it from GitHub"
-              git init
-              git remote add origin https://x-access-token:${GHCR_TOKEN}@github.com/${{ github.repository }}.git
-              git fetch origin main
-              git reset --hard origin/main
-              git remote set-url origin https://github.com/${{ github.repository }}.git
-            else
-              git clone https://x-access-token:${GHCR_TOKEN}@github.com/${{ github.repository }}.git .
-              git remote set-url origin https://github.com/${{ github.repository }}.git
-            fi
-
-            # Login to GHCR
-            echo "$GHCR_TOKEN" | sudo docker login ghcr.io -u mygads --password-stdin
-
-            # Set image and deploy using docker compose
-            export CLI_PROXY_IMAGE=ghcr.io/mygads/cli-proxy-api:latest
-
-            # Pull latest image. If GHCR denies access, build from the checked-out source instead.
-            if sudo -E docker compose pull; then
-              UP_COMMAND="sudo -E docker compose up -d --force-recreate"
-            else
-              echo "docker compose pull failed, building cli-proxy-api from local source instead..."
-              UP_COMMAND="sudo -E docker compose up -d --force-recreate --build --pull never cli-proxy-api"
-            fi
-
-            # First attempt; if Docker networking/iptables is stale, restart Docker once and retry.
-            if ! eval "\$UP_COMMAND"; then
-              echo "docker compose up failed, restarting Docker daemon and retrying once..."
-              sudo systemctl restart docker
-              sleep 5
-              eval "\$UP_COMMAND"
-            fi
-
-            # Wait for service to be ready
-            echo "Waiting for service to be ready..."
-            sleep 15
-
-            # Check container status
-            if ! sudo docker ps --filter "name=^/cli-proxy-api$" --filter "status=running" | grep -q cli-proxy-api; then
-              echo "cli-proxy-api container is not running after deploy"
-              sudo docker ps -a | grep cli-proxy-api || true
-              sudo docker logs cli-proxy-api --tail 50 || true
-              exit 1
-            fi
-
-            # Cleanup old images
-            sudo docker image prune -af --filter "until=24h" 2>/dev/null || true
-
-            echo "Deployment complete!"
-          ENDSSH
-
-      - name: Health Check
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-        run: |
-          echo "Running health check..."
-          sleep 15
-
-          ssh $VPS_USER@$VPS_HOST << 'ENDSSH'
-            for i in {1..5}; do
-              if curl -sf http://localhost:8317/healthz > /dev/null 2>&1; then
-                echo "Health check passed!"
-                sudo docker ps | grep cli-proxy-api
+            # Health check: management endpoint requires auth, but /v1/models
+            # is gated by api-key. We just verify the port answers.
+            sleep 8
+            for i in 1 2 3 4 5; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8317/v1/models -H 'Authorization: Bearer healthcheck-probe' || true)
+              if [ "$code" = "401" ] || [ "$code" = "200" ]; then
+                echo "Health check ok (HTTP $code)"
                 exit 0
               fi
-              echo "Attempt $i failed, retrying..."
+              echo "Health check attempt $i: HTTP $code"
               sleep 5
             done
-
-            echo "Health check failed!"
-            sudo docker logs cli-proxy-api --tail 50
+            echo "Health check failed"
+            docker compose logs --tail 50 cli-proxy-api || true
             exit 1
-          ENDSSH
+
+  cleanup:
+    name: Docker Cleanup
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always() && needs.deploy.result == 'success'
+    steps:
+      - name: Prune via SSH
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: docker system prune -af --filter "until=24h"
