@@ -97,8 +97,16 @@ jobs:
 
             # Sync repository — keep working tree aligned with main so
             # docker-compose.yml + Dockerfile updates flow through automatically.
+            #
+            # static/ and auths/ are bind-mounted into the container as root,
+            # which makes them undeletable by the cicddeploy user during a
+            # `git reset --hard`. Re-chown the working tree first; the docker
+            # daemon will re-acquire root ownership on the next container
+            # write since the bind mount is to a directory the daemon owns.
+            sudo chown -R cicddeploy:cicddeploy . || true
             git fetch origin main
             git reset --hard origin/main
+            git clean -fd -e static -e auths -e .env -e config.yaml -e config.yaml.backup.* -e .env.backup.* -e objectstore-config
 
             # Full .env replacement from secret (matches Genfity convention).
             # Container reads OBJECTSTORE_* from .env at startup and pulls
