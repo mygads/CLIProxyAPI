@@ -1159,6 +1159,18 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "kimi":
 		models = registry.GetKimiModels()
 		models = applyExcludedModels(models, excluded)
+	case "kiro":
+		// Kiro models map to AmazonCodeWhispererService.ListAvailableModels.
+		// The static list (registry.GetKiroModels) covers the catalog snapshot
+		// at build time; the live management /kiro-quota endpoint pulls the
+		// current values for the UI separately.
+		models = registry.GetKiroModels()
+		models = applyExcludedModels(models, excluded)
+	case "github":
+		// GitHub Copilot brokers third-party models (Claude/Gemini/etc.).
+		// The static list mirrors what /copilot_internal/models exposes.
+		models = registry.GetGitHubCopilotModels()
+		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
 		if s.cfg != nil {

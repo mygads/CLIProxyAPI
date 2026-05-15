@@ -76,10 +76,22 @@ func (h *Handler) GetGithubQuota(c *gin.Context) {
 		return
 	}
 
+	// /copilot_internal/user is the GitHub OAuth API, not the Copilot
+	// internal proxy — auth scheme is `token <gho_...>`, not
+	// `Bearer <copilot_token>`. See OmniRoute open-sse/services/usage.ts:942.
+	// We still rotate the Copilot token first as a side effect (so the
+	// chat path stays warm) but the probe itself uses access_token.
 	copilotToken, err := h.refreshGithubCopilotTokenForAuth(ctx, auth)
 	if err != nil {
 		log.Warnf("github quota: copilot token refresh failed for %s: %v", auth.ID, err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("copilot token refresh failed: %v", err)})
+		return
+	}
+	_ = copilotToken // not used directly; refresh path keeps it warm
+
+	accessToken, _ := auth.Metadata["access_token"].(string)
+	if strings.TrimSpace(accessToken) == "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "missing access_token in credential"})
 		return
 	}
 
@@ -88,11 +100,7 @@ func (h *Handler) GetGithubQuota(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("build request: %v", errReq)})
 		return
 	}
-	// Headers mirror OmniRoute's getGitHubCopilotInternalUserHeaders. The
-	// auth scheme is "Bearer <copilot_token>" — NOT "token <gho_...>" —
-	// because /copilot_internal/user is the Copilot-side API, not GitHub's
-	// REST API.
-	req.Header.Set("Authorization", "Bearer "+copilotToken)
+	req.Header.Set("Authorization", "token "+accessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-GitHub-Api-Version", githubauth.APIVersion)
 	req.Header.Set("User-Agent", githubauth.UserAgent)
