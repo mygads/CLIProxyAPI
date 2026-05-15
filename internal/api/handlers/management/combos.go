@@ -2,11 +2,24 @@ package management
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/combo"
 )
+
+// unescapeParam decodes a URL path parameter that may contain %2F (slash)
+// when the engine runs with UseRawPath=true + UnescapePathValues=false.
+// Combo names like "gen/deepseek-3.2" arrive as "gen%2Fdeepseek-3.2" in
+// the raw path; this helper restores the original value.
+func unescapeParam(raw string) string {
+	decoded, err := url.PathUnescape(raw)
+	if err != nil {
+		return raw
+	}
+	return decoded
+}
 
 // Virtual combo management endpoints.
 //
@@ -43,7 +56,7 @@ func (h *Handler) GetCombo(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "combo registry not initialised"})
 		return
 	}
-	name := c.Param("name")
+	name := unescapeParam(c.Param("name"))
 	got, ok := r.Get(name)
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "combo not found"})
@@ -60,7 +73,7 @@ func (h *Handler) PutCombo(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "combo registry not initialised"})
 		return
 	}
-	name := strings.TrimSpace(c.Param("name"))
+	name := strings.TrimSpace(unescapeParam(c.Param("name")))
 	if name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "combo name is required in the URL path"})
 		return
@@ -123,7 +136,7 @@ func (h *Handler) DeleteCombo(c *gin.Context) {
 		c.Status(http.StatusNoContent)
 		return
 	}
-	name := c.Param("name")
+	name := unescapeParam(c.Param("name"))
 	r.Delete(name)
 	// Drop metrics too so memory doesn't stay pinned by a dead combo.
 	if m := r.Metrics(); m != nil {
@@ -142,7 +155,7 @@ func (h *Handler) GetComboMetrics(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "combo registry not initialised"})
 		return
 	}
-	name := strings.TrimSpace(c.Param("name"))
+	name := strings.TrimSpace(unescapeParam(c.Param("name")))
 	if name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "combo name required"})
 		return

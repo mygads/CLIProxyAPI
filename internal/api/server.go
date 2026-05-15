@@ -275,6 +275,13 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Create gin engine
 	engine := gin.New()
+	// UseRawPath + UnescapePathValues=false ensures that %2F in URL path
+	// params stays encoded during route matching. Without this, combo names
+	// containing "/" (e.g. "gen/deepseek-3.2") get decoded before matching,
+	// Gin sees an extra path segment, and the request 404s. The handler
+	// receives the raw %-encoded value and must url.PathUnescape it itself.
+	engine.UseRawPath = true
+	engine.UnescapePathValues = false
 	if optionState.engineConfigurator != nil {
 		optionState.engineConfigurator(engine)
 	}
