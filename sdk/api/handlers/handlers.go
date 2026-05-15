@@ -920,28 +920,35 @@ type modelAttempt struct {
 // resolveModelAttempts returns the ordered list of models to try for a
 // request. For a combo name it returns all candidates from the registry;
 // for a plain prefixed model it returns a single-element slice.
+//
+// NOTE: combo names MAY contain "/" (e.g. "genfity/auto"). We therefore
+// check the combo registry FIRST before falling back to the "slash =
+// prefixed model" heuristic. This allows operators to name combos with
+// a vendor prefix (e.g. "genfity/gpt-5.5") while still routing plain
+// prefixed models (e.g. "kr/auto") directly.
 func (h *BaseAPIHandler) resolveModelAttempts(modelName string) []modelAttempt {
 	if h == nil || h.Combos == nil {
 		return []modelAttempt{{Model: modelName, IsLast: true}}
 	}
 	base := strings.TrimSpace(modelName)
-	// Combos cannot contain "/" — a slash means it is already a prefixed model.
-	if strings.Contains(base, "/") {
-		return []modelAttempt{{Model: modelName, IsLast: true}}
-	}
+
+	// Check combo registry first — combo names may contain "/" so we
+	// cannot use the slash as a shortcut to skip the registry lookup.
 	candidates, ok := h.Combos.Candidates(base)
-	if !ok || len(candidates) == 0 {
-		return []modelAttempt{{Model: modelName, IsLast: true}}
-	}
-	out := make([]modelAttempt, len(candidates))
-	for i, c := range candidates {
-		out[i] = modelAttempt{
-			Model:     c.Model,
-			TriggerOn: c.TriggerOn,
-			IsLast:    c.IsLast,
+	if ok && len(candidates) > 0 {
+		out := make([]modelAttempt, len(candidates))
+		for i, c := range candidates {
+			out[i] = modelAttempt{
+				Model:     c.Model,
+				TriggerOn: c.TriggerOn,
+				IsLast:    c.IsLast,
+			}
 		}
+		return out
 	}
-	return out
+
+	// Not a combo — treat as a plain prefixed model (e.g. "kr/auto").
+	return []modelAttempt{{Model: modelName, IsLast: true}}
 }
 
 // comboShouldFallback reports whether an error from one combo candidate
