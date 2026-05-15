@@ -101,7 +101,9 @@ func TestComboShouldFallback_retriableStatusOnly(t *testing.T) {
 		{400, `{"error":{"type":"invalid_request_error"}}`, false}, // user payload bug
 		{400, "invalid_argument: bad shape", false},
 		{400, `{"error":{"code":"model_not_supported"}}`, true}, // provider rejecting model
+		{400, `{"error":{"code":"model_not_allowed"}}`, true},
 		{400, "The requested model is not supported.", true},
+		{400, "The requested model is not allowed.", true},
 		{400, "weird 400 shape with no signal", true}, // unknown 400 — try next
 		{401, "unauthorized", true},
 		{402, "payment required", true},
@@ -153,7 +155,9 @@ func TestComboShouldFallback_triggerKeywordMatch(t *testing.T) {
 func TestComboShouldFallback_modelNotSupportedFallsThrough(t *testing.T) {
 	bodies := []string{
 		`{"error":{"code":"model_not_supported","message":"The requested model is not supported."}}`,
+		`{"error":{"code":"model_not_allowed","message":"The requested model is not allowed."}}`,
 		"The requested model is not supported.",
+		"The requested model is not allowed.",
 		"unsupported model: gpt-5.5",
 		"model unavailable",
 		"This model is not available for your account",

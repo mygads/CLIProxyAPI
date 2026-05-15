@@ -1241,11 +1241,15 @@ func isModelSupportBodyMessage(body string) bool {
 	}
 	patterns := [...]string{
 		"model_not_supported",
+		"model_not_allowed",
 		"requested model is not supported",
 		"requested model is unsupported",
 		"requested model is unavailable",
+		"requested model is not allowed",
 		"model is not supported",
 		"model not supported",
+		"model is not allowed",
+		"model not allowed",
 		"unsupported model",
 		"model unavailable",
 		"not available for your plan",
