@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
@@ -235,20 +236,45 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
+	// Commit headers + heartbeat early so the proxy chain (Cloudflare,
+	// nginx) sees activity before upstream emits its first chunk. Long
+	// Kiro / CodeWhisperer generations have observed TTFB > 100s, past
+	// CF's proxy_read_timeout, surfacing as 524 to the client.
+	setSSEHeaders()
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	_, _ = c.Writer.Write([]byte(": connected\n\n"))
+	flusher.Flush()
+
+	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
+	if keepAliveInterval <= 0 {
+		keepAliveInterval = 30 * time.Second
+	}
+	keepAliveTicker := time.NewTicker(keepAliveInterval)
+	defer keepAliveTicker.Stop()
+
 	// Peek at the first chunk to determine success or failure before setting headers
 	for {
 		select {
 		case <-c.Request.Context().Done():
 			cliCancel(c.Request.Context().Err())
 			return
+		case <-keepAliveTicker.C:
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
 		case errMsg, ok := <-errChan:
 			if !ok {
 				// Err channel closed cleanly; wait for data channel.
 				errChan = nil
 				continue
 			}
-			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
+			// Headers already committed — emit a SSE error event so the
+			// client gets a structured failure instead of a hung stream.
+			if errMsg != nil {
+				errBody := handlers.BuildErrorResponseBody(errMsg.StatusCode, errMsg.Error.Error())
+				_, _ = c.Writer.Write([]byte("event: error\n"))
+				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(errBody))
+			}
+			flusher.Flush()
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -257,17 +283,11 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
-				// Stream closed without data? Send DONE or just headers.
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				// Stream closed without data — nothing more to write.
 				flusher.Flush()
 				cliCancel(nil)
 				return
 			}
-
-			// Success! Set headers now.
-			setSSEHeaders()
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
 			// Write the first chunk
 			if len(chunk) > 0 {

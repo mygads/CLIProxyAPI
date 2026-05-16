@@ -197,20 +197,54 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
+	// Commit headers + heartbeat early so the proxy chain (Cloudflare,
+	// nginx) sees activity before upstream emits its first chunk. Long
+	// generations have observed TTFB > 100s, past CF's
+	// proxy_read_timeout, surfacing as 524 to the client.
+	if alt == "" {
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		_, _ = c.Writer.Write([]byte(": connected\n\n"))
+		flusher.Flush()
+	}
+
+	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
+	if keepAliveInterval <= 0 {
+		keepAliveInterval = 30 * time.Second
+	}
+	keepAliveTicker := time.NewTicker(keepAliveInterval)
+	defer keepAliveTicker.Stop()
+
 	// Peek at the first chunk
 	for {
 		select {
 		case <-c.Request.Context().Done():
 			cliCancel(c.Request.Context().Err())
 			return
+		case <-keepAliveTicker.C:
+			if alt == "" {
+				_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+				flusher.Flush()
+			}
 		case errMsg, ok := <-errChan:
 			if !ok {
 				// Err channel closed cleanly; wait for data channel.
 				errChan = nil
 				continue
 			}
-			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
+			if alt == "" {
+				if errMsg != nil {
+					errBody := handlers.BuildErrorResponseBody(errMsg.StatusCode, errMsg.Error.Error())
+					_, _ = c.Writer.Write([]byte("event: error\n"))
+					_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(errBody))
+				}
+				flusher.Flush()
+			} else {
+				// alt != "" means caller wanted a non-SSE body; we
+				// haven't committed headers yet, so a JSON error is
+				// still acceptable.
+				h.WriteErrorResponse(c, errMsg)
+			}
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -220,20 +254,19 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 		case chunk, ok := <-dataChan:
 			if !ok {
 				// Closed without data
-				if alt == "" {
-					setSSEHeaders()
+				if alt != "" {
+					handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				}
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				flusher.Flush()
 				cliCancel(nil)
 				return
 			}
 
-			// Success! Set headers.
-			if alt == "" {
-				setSSEHeaders()
+			// Headers either already committed (SSE path) or about to
+			// be committed by the caller (alt path).
+			if alt != "" {
+				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 			}
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
 			// Write first chunk
 			if alt == "" {

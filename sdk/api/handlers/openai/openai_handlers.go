@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
@@ -489,20 +490,49 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
+	// Commit SSE headers immediately and flush a no-op heartbeat so the
+	// proxy chain (Cloudflare, nginx, ...) sees activity right away.
+	// Without this the connection stays silent until upstream emits its
+	// first chunk; long Kiro / CodeWhisperer generations have observed
+	// TTFB > 100s, which is past Cloudflare's proxy_read_timeout window
+	// and surfaces to clients as a 524.
+	setSSEHeaders()
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	_, _ = c.Writer.Write([]byte(": connected\n\n"))
+	flusher.Flush()
+	headersCommitted := true
+
+	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
+	if keepAliveInterval <= 0 {
+		keepAliveInterval = 30 * time.Second
+	}
+	keepAliveTicker := time.NewTicker(keepAliveInterval)
+	defer keepAliveTicker.Stop()
+
 	// Peek at the first chunk to determine success or failure before setting headers
 	for {
 		select {
 		case <-c.Request.Context().Done():
 			cliCancel(c.Request.Context().Err())
 			return
+		case <-keepAliveTicker.C:
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
 		case errMsg, ok := <-errChan:
 			if !ok {
 				// Err channel closed cleanly; wait for data channel.
 				errChan = nil
 				continue
 			}
-			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
+			// Upstream failed before producing data. Headers are
+			// already committed, so we cannot return an HTTP status —
+			// emit an SSE error event + [DONE] instead.
+			if errMsg != nil {
+				errBody := handlers.BuildErrorResponseBody(errMsg.StatusCode, errMsg.Error.Error())
+				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(errBody))
+			}
+			_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
+			flusher.Flush()
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -511,21 +541,16 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
-				// Stream closed without data? Send DONE or just headers.
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				// Stream closed without data? Send DONE.
 				_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
 				flusher.Flush()
 				cliCancel(nil)
 				return
 			}
 
-			// Success! Commit to streaming headers.
-			setSSEHeaders()
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-
 			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
 			flusher.Flush()
+			_ = headersCommitted
 
 			// Continue streaming the rest
 			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
@@ -597,19 +622,44 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
+	// Commit headers + heartbeat early so the proxy chain (Cloudflare,
+	// nginx) sees activity before upstream emits its first chunk. Long
+	// Kiro generations have observed TTFB > 100s, past CF's
+	// proxy_read_timeout, surfacing as 524 to the client.
+	setSSEHeaders()
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	_, _ = c.Writer.Write([]byte(": connected\n\n"))
+	flusher.Flush()
+
+	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
+	if keepAliveInterval <= 0 {
+		keepAliveInterval = 30 * time.Second
+	}
+	keepAliveTicker := time.NewTicker(keepAliveInterval)
+	defer keepAliveTicker.Stop()
+
 	// Peek at the first chunk
 	for {
 		select {
 		case <-c.Request.Context().Done():
 			cliCancel(c.Request.Context().Err())
 			return
+		case <-keepAliveTicker.C:
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
 		case errMsg, ok := <-errChan:
 			if !ok {
 				// Err channel closed cleanly; wait for data channel.
 				errChan = nil
 				continue
 			}
-			h.WriteErrorResponse(c, errMsg)
+			// Headers already committed — emit SSE error event.
+			if errMsg != nil {
+				errBody := handlers.BuildErrorResponseBody(errMsg.StatusCode, errMsg.Error.Error())
+				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(errBody))
+			}
+			_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
+			flusher.Flush()
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -618,17 +668,11 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
 				flusher.Flush()
 				cliCancel(nil)
 				return
 			}
-
-			// Success! Set headers.
-			setSSEHeaders()
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
 			// Write the first chunk
 			converted := convertChatCompletionsStreamChunkToCompletions(chunk)
