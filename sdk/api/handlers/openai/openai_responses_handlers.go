@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -493,6 +494,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("X-Accel-Buffering", "no")
 	}
 	framer := &responsesSSEFramer{}
 
@@ -502,7 +504,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	// proxy_read_timeout, surfacing as 524 to the client.
 	setSSEHeaders()
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	_, _ = c.Writer.Write([]byte(": connected\n\n"))
+	_, _ = c.Writer.Write([]byte(": connected " + strings.Repeat("-", 2048) + "\n\n"))
 	flusher.Flush()
 
 	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)

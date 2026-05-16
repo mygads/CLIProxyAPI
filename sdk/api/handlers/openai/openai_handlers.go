@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -488,6 +489,11 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
+		// Disable proxy response buffering (nginx, Cloudflare workers,
+		// some CDNs respect this hint). Without it the early
+		// ": connected" heartbeat may be held until the buffer fills,
+		// which defeats the whole point of an early flush.
+		c.Header("X-Accel-Buffering", "no")
 	}
 
 	// Commit SSE headers immediately and flush a no-op heartbeat so the
@@ -498,7 +504,10 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 	// and surfaces to clients as a 524.
 	setSSEHeaders()
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	_, _ = c.Writer.Write([]byte(": connected\n\n"))
+	// 2 KiB padding nudges intermediate proxies that hold output until
+	// their internal buffer fills. The line is a SSE comment so clients
+	// ignore it; it never reaches the SDK consumer.
+	_, _ = c.Writer.Write([]byte(": connected " + strings.Repeat("-", 2048) + "\n\n"))
 	flusher.Flush()
 	headersCommitted := true
 
@@ -620,6 +629,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("X-Accel-Buffering", "no")
 	}
 
 	// Commit headers + heartbeat early so the proxy chain (Cloudflare,
@@ -628,7 +638,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 	// proxy_read_timeout, surfacing as 524 to the client.
 	setSSEHeaders()
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	_, _ = c.Writer.Write([]byte(": connected\n\n"))
+	_, _ = c.Writer.Write([]byte(": connected " + strings.Repeat("-", 2048) + "\n\n"))
 	flusher.Flush()
 
 	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)

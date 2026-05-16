@@ -195,6 +195,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("X-Accel-Buffering", "no")
 	}
 
 	// Commit headers + heartbeat early so the proxy chain (Cloudflare,
@@ -204,7 +205,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 	if alt == "" {
 		setSSEHeaders()
 		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-		_, _ = c.Writer.Write([]byte(": connected\n\n"))
+		_, _ = c.Writer.Write([]byte(": connected " + strings.Repeat("-", 2048) + "\n\n"))
 		flusher.Flush()
 	}
 
@@ -337,7 +338,8 @@ func (h *GeminiAPIHandler) handleGenerateContent(c *gin.Context, modelName strin
 func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	var keepAliveInterval *time.Duration
 	if alt != "" {
-		keepAliveInterval = new(time.Duration(0))
+		zero := time.Duration(0)
+		keepAliveInterval = &zero
 	}
 
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
