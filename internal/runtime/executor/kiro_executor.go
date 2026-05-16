@@ -28,21 +28,17 @@ import (
 
 // KiroExecutor is a wiring-complete executor for the Kiro AI provider.
 //
-// SCOPE NOTE (2026-05): this implementation handles the *basic* single-turn
-// chat path — each incoming OpenAI message is concatenated into one
-// userInputMessage.content string, sent to CodeWhisperer, and the resulting
-// eventstream is decoded back to an OpenAI-compatible response. It is
-// deliberately narrower than 9router's Kiro translator:
+// Behavior is parity with 9router's openai-to-kiro translator (2026-05):
 //
-//   - No full conversation history: previous turns are flattened into the
-//     single content string rather than being sent as a history array.
-//   - No tool/function calling: tools in the request are dropped.
-//   - No multimodal (images): content parts that are not plain text are
-//     rendered as a placeholder string.
-//
-// Those gaps are tracked in docs/PHASE-2-OAUTH-PROVIDERS-FOLLOWUP.md and are
-// safe to close incrementally once there are credentials to test against.
-// The narrow path gets us end-to-end traffic through the decoder today.
+//   - Full conversation history with proper user/assistant turns.
+//   - Tool / function calling: body.tools → userInputMessageContext.tools,
+//     assistant.tool_calls → assistantResponseMessage.toolUses, tool role
+//     and content[].type==tool_result → userInputMessageContext.toolResults.
+//   - Consecutive user turns are merged so Kiro does not reject the chain.
+//   - Deterministic conversationId via uuidv5(first turn content, NAMESPACE)
+//     so AWS Builder ID context cache stays warm.
+//   - Multimodal: text and base64 image_url/image parts are forwarded;
+//     remote URLs fall back to a "[Image: …]" placeholder.
 type KiroExecutor struct {
 	cfg *config.Config
 }
@@ -105,80 +101,74 @@ func (e *KiroExecutor) ensureAccessToken(ctx context.Context, auth *cliproxyauth
 }
 
 // buildKiroPayload converts an OpenAI-format request to CodeWhisperer's
-// GenerateAssistantResponse shape. See SCOPE NOTE at the top of the file —
-// this is the single-turn reduction, not the full port.
+// GenerateAssistantResponse shape. Behavior is parity with 9router's
+// openai-to-kiro translator: full history, tools, toolUses, toolResults,
+// images, deterministic conversationId.
 func (e *KiroExecutor) buildKiroPayload(openaiBody []byte, model string, auth *cliproxyauth.Auth) ([]byte, error) {
 	messages := gjson.GetBytes(openaiBody, "messages").Array()
+	tools := gjson.GetBytes(openaiBody, "tools").Array()
 
-	// Flatten prior turns into a single prompt string. Assistant turns
-	// are labelled so the model knows they are its own past replies.
-	var sb strings.Builder
-	for i, msg := range messages {
-		role := msg.Get("role").String()
-		content := extractMessageContent(msg)
-		if content == "" {
-			continue
-		}
-		if i == len(messages)-1 && role == "user" {
-			// Last user message goes into currentMessage, not history.
-			continue
-		}
-		switch role {
-		case "system":
-			sb.WriteString("[System]\n")
-		case "user":
-			sb.WriteString("[User]\n")
-		case "assistant":
-			sb.WriteString("[Assistant]\n")
-		default:
-			sb.WriteString("[" + role + "]\n")
-		}
-		sb.WriteString(content)
-		sb.WriteString("\n\n")
+	history, currentMessage, err := convertKiroMessages(messages, tools, model)
+	if err != nil {
+		return nil, err
 	}
 
-	// The *actual* current turn is the last user message.
-	var currentContent string
-	if n := len(messages); n > 0 && messages[n-1].Get("role").String() == "user" {
-		currentContent = extractMessageContent(messages[n-1])
-	}
-	if currentContent == "" && sb.Len() == 0 {
-		return nil, fmt.Errorf("kiro: no user content to send")
-	}
-
-	// Combine flattened history with the current turn.
-	var finalContent string
-	if sb.Len() > 0 {
-		finalContent = sb.String() + "[User]\n" + currentContent
-	} else {
-		finalContent = currentContent
-	}
-	// Light context marker mirrors the 9router reference so the model
-	// behaves consistently with that deployment.
+	finalContent, _ := getKiroUserInputString(currentMessage, "content")
 	finalContent = fmt.Sprintf("[Context: Current time is %s]\n\n%s",
 		time.Now().UTC().Format(time.RFC3339), finalContent)
+
+	currentUserInput := map[string]any{
+		"content": finalContent,
+		"modelId": model,
+		"origin":  "AI_EDITOR",
+	}
+	if currentMessage != nil {
+		if uim, ok := currentMessage["userInputMessage"].(map[string]any); ok {
+			if ctx, ok := uim["userInputMessageContext"].(map[string]any); ok && len(ctx) > 0 {
+				currentUserInput["userInputMessageContext"] = ctx
+			}
+			if imgs, ok := uim["images"].([]any); ok && len(imgs) > 0 {
+				currentUserInput["images"] = imgs
+			}
+		}
+	}
+
+	// Deterministic conversationId for AWS Builder ID context cache.
+	// Use uuidv5 over the first turn's content (capped at 4000 chars).
+	firstContent := finalContent
+	if len(history) > 0 {
+		if uim, ok := history[0].(map[string]any)["userInputMessage"].(map[string]any); ok {
+			if c, ok := uim["content"].(string); ok && c != "" {
+				firstContent = c
+			}
+		}
+	}
+	if len(firstContent) > 4000 {
+		firstContent = firstContent[:4000]
+	}
+	convoID := uuid.NewSHA1(kiroConversationNamespace, []byte(firstContent)).String()
 
 	payload := map[string]any{
 		"conversationState": map[string]any{
 			"chatTriggerType": "MANUAL",
-			"conversationId":  uuid.New().String(),
+			"conversationId":  convoID,
 			"currentMessage": map[string]any{
-				"userInputMessage": map[string]any{
-					"content": finalContent,
-					"modelId": model,
-					"origin":  "AI_EDITOR",
-				},
+				"userInputMessage": currentUserInput,
 			},
-			"history": []any{},
+			"history": history,
 		},
 	}
-	if profileArn, _ := auth.Metadata["profile_arn"].(string); profileArn != "" {
-		payload["profileArn"] = profileArn
+	if auth != nil && auth.Metadata != nil {
+		if profileArn, _ := auth.Metadata["profile_arn"].(string); profileArn != "" {
+			payload["profileArn"] = profileArn
+		}
 	}
 
 	// inferenceConfig is optional — honor max_tokens/temperature/top_p if set.
 	inferenceConfig := map[string]any{}
 	if v := gjson.GetBytes(openaiBody, "max_tokens"); v.Exists() {
+		inferenceConfig["maxTokens"] = v.Int()
+	} else if v := gjson.GetBytes(openaiBody, "max_completion_tokens"); v.Exists() {
 		inferenceConfig["maxTokens"] = v.Int()
 	}
 	if v := gjson.GetBytes(openaiBody, "temperature"); v.Exists() {
@@ -194,32 +184,541 @@ func (e *KiroExecutor) buildKiroPayload(openaiBody []byte, model string, auth *c
 	return json.Marshal(payload)
 }
 
-// extractMessageContent coerces an OpenAI-style message content into a
-// plain string. Content may be a string OR an array of parts; for arrays
-// we concatenate only text parts. Non-text parts (images, tool results)
-// are rendered as a placeholder so the user sees something was there.
-func extractMessageContent(msg gjson.Result) string {
-	content := msg.Get("content")
-	if content.Type == gjson.String {
-		return strings.TrimSpace(content.String())
+// kiroConversationNamespace mirrors 9router's NAMESPACE_KIRO constant so
+// the same first-turn content yields the same UUID, keeping AWS Builder
+// ID prompt-cache lookups consistent across deployments.
+var kiroConversationNamespace = uuid.MustParse("34f7193f-561d-4050-bc84-9547d953d6bf")
+
+// getKiroUserInputString safely fetches a string field from
+// currentMessage.userInputMessage. Returns empty string when missing.
+func getKiroUserInputString(currentMessage map[string]any, key string) (string, bool) {
+	if currentMessage == nil {
+		return "", false
 	}
-	if !content.IsArray() {
-		return ""
+	uim, ok := currentMessage["userInputMessage"].(map[string]any)
+	if !ok {
+		return "", false
 	}
-	var sb strings.Builder
-	for _, part := range content.Array() {
-		switch part.Get("type").String() {
-		case "text":
-			sb.WriteString(part.Get("text").String())
-		case "image_url", "image":
-			sb.WriteString("[image attachment]")
-		case "tool_result":
-			if v := part.Get("content"); v.Exists() {
-				sb.WriteString(v.String())
+	v, ok := uim[key].(string)
+	return v, ok
+}
+
+// convertKiroMessages walks an OpenAI-shaped messages array and produces
+// (history, currentMessage) for Kiro's GenerateAssistantResponse payload.
+// It is a Go port of 9router's convertMessages — see
+// 9router/open-sse/translator/request/openai-to-kiro.js for parity.
+//
+// Rules:
+//   - system/tool roles are normalized to user.
+//   - Consecutive same-role turns are buffered into one Kiro turn.
+//   - Tools (body.tools) are attached to the first user turn's
+//     userInputMessageContext.tools and forwarded to currentMessage so the
+//     final turn carries tool defs to upstream.
+//   - assistant.tool_calls and assistant.content[].type=="tool_use" are
+//     attached as assistantResponseMessage.toolUses.
+//   - tool role and content[].type=="tool_result" become
+//     userInputMessageContext.toolResults on the next user turn.
+//   - Base64 image_url / Claude image parts are forwarded; remote http(s)
+//     URLs degrade to a "[Image: …]" placeholder.
+//   - The last userInputMessage in history becomes currentMessage; if the
+//     conversation ends with assistant/tool, currentMessage is a
+//     "Continue" stub.
+//   - Adjacent userInputMessage entries left over after the assistant
+//     branch resets currentRole are merged into one.
+func convertKiroMessages(messages []gjson.Result, tools []gjson.Result, model string) ([]any, map[string]any, error) {
+	history := []any{}
+	var pendingUserContent []string
+	var pendingAssistantContent []string
+	var pendingToolResults []map[string]any
+	var pendingImages []map[string]any
+	var currentRole string
+
+	flushPending := func() {
+		switch currentRole {
+		case "user":
+			content := strings.TrimSpace(strings.Join(pendingUserContent, "\n\n"))
+			if content == "" {
+				content = "continue"
+			}
+			userMsg := map[string]any{
+				"userInputMessage": map[string]any{
+					"content": content,
+					"modelId": "",
+				},
+			}
+			uim := userMsg["userInputMessage"].(map[string]any)
+			if len(pendingImages) > 0 {
+				imgs := make([]any, 0, len(pendingImages))
+				for _, img := range pendingImages {
+					imgs = append(imgs, img)
+				}
+				uim["images"] = imgs
+			}
+			if len(pendingToolResults) > 0 {
+				tr := make([]any, 0, len(pendingToolResults))
+				for _, r := range pendingToolResults {
+					tr = append(tr, r)
+				}
+				uim["userInputMessageContext"] = map[string]any{"toolResults": tr}
+			}
+			// Tools attach to the first user turn only.
+			if len(tools) > 0 && len(history) == 0 {
+				ctx, _ := uim["userInputMessageContext"].(map[string]any)
+				if ctx == nil {
+					ctx = map[string]any{}
+				}
+				ctx["tools"] = buildKiroToolSpecs(tools)
+				uim["userInputMessageContext"] = ctx
+			}
+			history = append(history, userMsg)
+			pendingUserContent = nil
+			pendingToolResults = nil
+			pendingImages = nil
+		case "assistant":
+			content := strings.TrimSpace(strings.Join(pendingAssistantContent, "\n\n"))
+			if content == "" {
+				content = "..."
+			}
+			assistantMsg := map[string]any{
+				"assistantResponseMessage": map[string]any{
+					"content": content,
+				},
+			}
+			history = append(history, assistantMsg)
+			pendingAssistantContent = nil
+		}
+	}
+
+	for _, msg := range messages {
+		role := msg.Get("role").String()
+		if role == "system" || role == "tool" {
+			role = "user"
+		}
+		if role != currentRole && currentRole != "" {
+			flushPending()
+		}
+		currentRole = role
+
+		if role == "user" {
+			textContent, images, toolResults := extractKiroUserParts(msg)
+			pendingImages = append(pendingImages, images...)
+			pendingToolResults = append(pendingToolResults, toolResults...)
+			if msg.Get("role").String() == "tool" {
+				toolContent := msg.Get("content").String()
+				pendingToolResults = append(pendingToolResults, map[string]any{
+					"toolUseId": msg.Get("tool_call_id").String(),
+					"status":    "success",
+					"content":   []any{map[string]any{"text": toolContent}},
+				})
+			} else if textContent != "" {
+				pendingUserContent = append(pendingUserContent, textContent)
+			}
+			continue
+		}
+
+		if role == "assistant" {
+			textContent, toolUses := extractKiroAssistantParts(msg)
+			if textContent != "" {
+				pendingAssistantContent = append(pendingAssistantContent, textContent)
+			}
+			if len(toolUses) > 0 {
+				flushPending()
+				if last, ok := history[len(history)-1].(map[string]any); ok {
+					if arm, ok := last["assistantResponseMessage"].(map[string]any); ok {
+						arm["toolUses"] = toolUses
+					}
+				}
+				currentRole = ""
 			}
 		}
 	}
-	return strings.TrimSpace(sb.String())
+
+	if currentRole != "" {
+		flushPending()
+	}
+
+	if len(history) == 0 {
+		return nil, nil, fmt.Errorf("kiro: no messages to send")
+	}
+
+	// Pop the last userInputMessage from history as currentMessage.
+	var currentMessage map[string]any
+	for i := len(history) - 1; i >= 0; i-- {
+		entry, _ := history[i].(map[string]any)
+		if entry == nil {
+			continue
+		}
+		if _, ok := entry["userInputMessage"]; ok {
+			currentMessage = entry
+			history = append(history[:i], history[i+1:]...)
+			break
+		}
+	}
+
+	// Capture first-history tools BEFORE cleanup deletes them — they
+	// must travel on currentMessage so upstream sees the spec.
+	var firstTools any
+	if len(history) > 0 {
+		if entry, ok := history[0].(map[string]any); ok {
+			if uim, ok := entry["userInputMessage"].(map[string]any); ok {
+				if ctx, ok := uim["userInputMessageContext"].(map[string]any); ok {
+					if t, ok := ctx["tools"]; ok {
+						firstTools = t
+					}
+				}
+			}
+		}
+	}
+
+	// Cleanup history: strip tools from history user turns (currentMessage
+	// owns them), drop empty contexts, and ensure modelId is set.
+	for _, raw := range history {
+		entry, _ := raw.(map[string]any)
+		if entry == nil {
+			continue
+		}
+		uim, _ := entry["userInputMessage"].(map[string]any)
+		if uim == nil {
+			continue
+		}
+		if ctx, ok := uim["userInputMessageContext"].(map[string]any); ok {
+			delete(ctx, "tools")
+			if len(ctx) == 0 {
+				delete(uim, "userInputMessageContext")
+			}
+		}
+		if id, _ := uim["modelId"].(string); id == "" {
+			uim["modelId"] = model
+		}
+	}
+
+	// Merge consecutive userInputMessage entries (Kiro requires
+	// alternating user/assistant). The assistant branch's currentRole
+	// reset can leave adjacent user turns in history.
+	mergedHistory := make([]any, 0, len(history))
+	for _, raw := range history {
+		entry, _ := raw.(map[string]any)
+		if entry == nil {
+			mergedHistory = append(mergedHistory, raw)
+			continue
+		}
+		curUIM, isUser := entry["userInputMessage"].(map[string]any)
+		if isUser && len(mergedHistory) > 0 {
+			prev, _ := mergedHistory[len(mergedHistory)-1].(map[string]any)
+			if prev != nil {
+				if prevUIM, ok := prev["userInputMessage"].(map[string]any); ok {
+					prevContent, _ := prevUIM["content"].(string)
+					curContent, _ := curUIM["content"].(string)
+					if prevContent != "" && curContent != "" {
+						prevUIM["content"] = prevContent + "\n\n" + curContent
+					} else if curContent != "" {
+						prevUIM["content"] = curContent
+					}
+					if curCtx, ok := curUIM["userInputMessageContext"].(map[string]any); ok {
+						prevCtx, _ := prevUIM["userInputMessageContext"].(map[string]any)
+						if prevCtx == nil {
+							prevCtx = map[string]any{}
+						}
+						for k, v := range curCtx {
+							if existing, ok := prevCtx[k].([]any); ok {
+								if next, ok := v.([]any); ok {
+									prevCtx[k] = append(existing, next...)
+									continue
+								}
+							}
+							prevCtx[k] = v
+						}
+						prevUIM["userInputMessageContext"] = prevCtx
+					}
+					if curImgs, ok := curUIM["images"].([]any); ok && len(curImgs) > 0 {
+						prevImgs, _ := prevUIM["images"].([]any)
+						prevUIM["images"] = append(prevImgs, curImgs...)
+					}
+					continue
+				}
+			}
+		}
+		mergedHistory = append(mergedHistory, raw)
+	}
+	history = mergedHistory
+
+	// If the conversation ended with assistant/tool we still need a
+	// user turn for currentMessage. Use a "Continue" stub so upstream
+	// keeps generating from the prior assistant tail.
+	if currentMessage == nil {
+		currentMessage = map[string]any{
+			"userInputMessage": map[string]any{
+				"content": "Continue",
+				"modelId": model,
+			},
+		}
+	}
+
+	// Inject tools onto currentMessage AFTER cleanup so upstream sees them.
+	if firstTools != nil {
+		if uim, ok := currentMessage["userInputMessage"].(map[string]any); ok {
+			ctx, _ := uim["userInputMessageContext"].(map[string]any)
+			if ctx == nil {
+				ctx = map[string]any{}
+			}
+			if _, has := ctx["tools"]; !has {
+				ctx["tools"] = firstTools
+			}
+			uim["userInputMessageContext"] = ctx
+		}
+	}
+
+	return history, currentMessage, nil
+}
+
+// buildKiroToolSpecs converts OpenAI/Anthropic tool definitions into
+// Kiro's toolSpecification shape. Kiro requires every schema to have
+// {type, properties, required}, so we normalize defensively.
+func buildKiroToolSpecs(tools []gjson.Result) []any {
+	out := make([]any, 0, len(tools))
+	for _, t := range tools {
+		name := t.Get("function.name").String()
+		if name == "" {
+			name = t.Get("name").String()
+		}
+		desc := t.Get("function.description").String()
+		if desc == "" {
+			desc = t.Get("description").String()
+		}
+		if strings.TrimSpace(desc) == "" {
+			desc = "Tool: " + name
+		}
+		schemaResult := t.Get("function.parameters")
+		if !schemaResult.Exists() {
+			schemaResult = t.Get("parameters")
+		}
+		if !schemaResult.Exists() {
+			schemaResult = t.Get("input_schema")
+		}
+		var schema map[string]any
+		if schemaResult.Exists() && schemaResult.IsObject() {
+			_ = json.Unmarshal([]byte(schemaResult.Raw), &schema)
+		}
+		schema = normalizeKiroToolSchema(schema)
+		out = append(out, map[string]any{
+			"toolSpecification": map[string]any{
+				"name":        name,
+				"description": desc,
+				"inputSchema": map[string]any{"json": schema},
+			},
+		})
+	}
+	return out
+}
+
+func normalizeKiroToolSchema(schema map[string]any) map[string]any {
+	if len(schema) == 0 {
+		return map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+			"required":   []any{},
+		}
+	}
+	out := map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	}
+	for k, v := range schema {
+		out[k] = v
+	}
+	if _, ok := out["required"].([]any); !ok {
+		// Tolerate []string or []interface variations.
+		if r, ok := schema["required"]; ok {
+			if rArr, ok := r.([]any); ok {
+				out["required"] = rArr
+			} else {
+				out["required"] = []any{}
+			}
+		} else {
+			out["required"] = []any{}
+		}
+	}
+	return out
+}
+
+// extractKiroUserParts pulls (text, images, toolResults) from a single
+// user-role message. Content may be a string or an OpenAI/Claude content
+// array; both are accepted.
+func extractKiroUserParts(msg gjson.Result) (string, []map[string]any, []map[string]any) {
+	content := msg.Get("content")
+	if content.Type == gjson.String {
+		return strings.TrimSpace(content.String()), nil, nil
+	}
+	if !content.IsArray() {
+		return "", nil, nil
+	}
+	var textParts []string
+	var images []map[string]any
+	var toolResults []map[string]any
+	for _, part := range content.Array() {
+		switch part.Get("type").String() {
+		case "text":
+			textParts = append(textParts, part.Get("text").String())
+		case "image_url":
+			url := part.Get("image_url.url").String()
+			if img := parseDataURIImage(url); img != nil {
+				images = append(images, img)
+			} else if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+				textParts = append(textParts, "[Image: "+url+"]")
+			}
+		case "image":
+			if part.Get("source.type").String() == "base64" {
+				if data := part.Get("source.data").String(); data != "" {
+					mediaType := part.Get("source.media_type").String()
+					if mediaType == "" {
+						mediaType = "image/png"
+					}
+					images = append(images, map[string]any{
+						"format": imageFormatFromMediaType(mediaType),
+						"source": map[string]any{"bytes": data},
+					})
+				}
+			}
+		case "tool_result":
+			text := ""
+			inner := part.Get("content")
+			if inner.IsArray() {
+				var parts []string
+				for _, c := range inner.Array() {
+					parts = append(parts, c.Get("text").String())
+				}
+				text = strings.Join(parts, "\n")
+			} else if inner.Type == gjson.String {
+				text = inner.String()
+			}
+			toolResults = append(toolResults, map[string]any{
+				"toolUseId": part.Get("tool_use_id").String(),
+				"status":    "success",
+				"content":   []any{map[string]any{"text": text}},
+			})
+		default:
+			// Some clients send untyped {text: "..."} parts.
+			if t := part.Get("text").String(); t != "" {
+				textParts = append(textParts, t)
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(textParts, "\n")), images, toolResults
+}
+
+// extractKiroAssistantParts returns (textContent, toolUses) for an
+// assistant message. tool_calls (OpenAI) and content[].type=="tool_use"
+// (Claude) both feed the same toolUses array.
+func extractKiroAssistantParts(msg gjson.Result) (string, []any) {
+	var textContent string
+	var toolUses []any
+
+	content := msg.Get("content")
+	if content.IsArray() {
+		var textParts []string
+		for _, part := range content.Array() {
+			switch part.Get("type").String() {
+			case "text":
+				textParts = append(textParts, part.Get("text").String())
+			case "tool_use":
+				toolUses = append(toolUses, map[string]any{
+					"toolUseId": orFallback(part.Get("id").String(), uuid.New().String()),
+					"name":      part.Get("name").String(),
+					"input":     parseKiroToolInput(part.Get("input")),
+				})
+			}
+		}
+		textContent = strings.TrimSpace(strings.Join(textParts, "\n"))
+	} else if content.Type == gjson.String {
+		textContent = strings.TrimSpace(content.String())
+	}
+
+	if tc := msg.Get("tool_calls"); tc.IsArray() {
+		// Replace any inferred Claude-style tool uses with OpenAI ones.
+		toolUses = toolUses[:0]
+		for _, t := range tc.Array() {
+			if fn := t.Get("function"); fn.Exists() {
+				toolUses = append(toolUses, map[string]any{
+					"toolUseId": orFallback(t.Get("id").String(), uuid.New().String()),
+					"name":      fn.Get("name").String(),
+					"input":     parseKiroToolInput(fn.Get("arguments")),
+				})
+			} else {
+				toolUses = append(toolUses, map[string]any{
+					"toolUseId": orFallback(t.Get("id").String(), uuid.New().String()),
+					"name":      t.Get("name").String(),
+					"input":     parseKiroToolInput(t.Get("input")),
+				})
+			}
+		}
+	}
+
+	return textContent, toolUses
+}
+
+func parseKiroToolInput(v gjson.Result) any {
+	if !v.Exists() {
+		return map[string]any{}
+	}
+	if v.IsObject() {
+		var out map[string]any
+		if err := json.Unmarshal([]byte(v.Raw), &out); err == nil {
+			return out
+		}
+		return map[string]any{}
+	}
+	if v.Type == gjson.String {
+		s := strings.TrimSpace(v.String())
+		if s == "" {
+			return map[string]any{}
+		}
+		var out map[string]any
+		if err := json.Unmarshal([]byte(s), &out); err == nil {
+			return out
+		}
+		return map[string]any{}
+	}
+	return map[string]any{}
+}
+
+func orFallback(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
+}
+
+// parseDataURIImage extracts {format, source.bytes} from a data: URL like
+// "data:image/png;base64,…". Returns nil for non-data URIs.
+func parseDataURIImage(url string) map[string]any {
+	if !strings.HasPrefix(url, "data:") {
+		return nil
+	}
+	rest := url[len("data:"):]
+	semi := strings.Index(rest, ";")
+	if semi <= 0 {
+		return nil
+	}
+	mediaType := rest[:semi]
+	rest = rest[semi+1:]
+	if !strings.HasPrefix(rest, "base64,") {
+		return nil
+	}
+	data := rest[len("base64,"):]
+	if data == "" {
+		return nil
+	}
+	return map[string]any{
+		"format": imageFormatFromMediaType(mediaType),
+		"source": map[string]any{"bytes": data},
+	}
+}
+
+func imageFormatFromMediaType(mediaType string) string {
+	if i := strings.Index(mediaType, "/"); i >= 0 {
+		return mediaType[i+1:]
+	}
+	return mediaType
 }
 
 // Execute performs a non-streaming request to CodeWhisperer and assembles
