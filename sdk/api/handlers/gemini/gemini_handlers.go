@@ -204,7 +204,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 	if alt == "" {
 		setSSEHeaders()
 		c.Status(http.StatusOK)
-		_, _ = c.Writer.Write([]byte(": connected " + strings.Repeat("-", 2048) + "\n\n"))
+		_, _ = c.Writer.Write([]byte(": connected " + strings.Repeat("-", 32*1024) + "\n\n"))
 		flusher.Flush()
 	}
 
