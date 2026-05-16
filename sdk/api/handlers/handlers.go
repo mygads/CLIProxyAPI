@@ -1163,6 +1163,9 @@ func comboShouldFallback(errMsg *interfaces.ErrorMessage, triggers []string) boo
 	if errMsg.Error != nil {
 		body = errMsg.Error.Error()
 	}
+	if isTransportError(body) {
+		return true
+	}
 	if !comboStatusEligibleForFallback(status, body) {
 		return false
 	}
@@ -1229,6 +1232,28 @@ func comboStatusEligibleForFallback(status int, body string) bool {
 		// down). Combo's job is to route around them.
 		return true
 	}
+}
+
+func isTransportError(body string) bool {
+	lower := strings.ToLower(body)
+	patterns := [...]string{
+		"context deadline exceeded",
+		"connection reset",
+		"connection refused",
+		"broken pipe",
+		"eof",
+		"timeout",
+		"no such host",
+		"tls handshake",
+		"network is unreachable",
+		"i/o timeout",
+	}
+	for _, p := range patterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // isModelSupportBodyMessage matches the same patterns the auth conductor

@@ -96,6 +96,10 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			}
 			writeChunk(chunk)
 			flusher.Flush()
+			if c.Request.Context().Err() != nil {
+				cancel(c.Request.Context().Err())
+				return
+			}
 		case errMsg, ok := <-errs:
 			if !ok {
 				continue
@@ -116,6 +120,10 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 		case <-keepAliveC:
 			writeKeepAlive()
 			flusher.Flush()
+			if c.Request.Context().Err() != nil {
+				cancel(c.Request.Context().Err())
+				return
+			}
 		}
 	}
 }

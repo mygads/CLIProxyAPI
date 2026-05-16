@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
@@ -40,7 +41,8 @@ import (
 //   - Multimodal: text and base64 image_url/image parts are forwarded;
 //     remote URLs fall back to a "[Image: …]" placeholder.
 type KiroExecutor struct {
-	cfg *config.Config
+	cfg       *config.Config
+	refreshMu sync.Map
 }
 
 // NewKiroExecutor builds the executor. The config is used for proxy-aware
@@ -93,6 +95,10 @@ func (e *KiroExecutor) ensureAccessToken(ctx context.Context, auth *cliproxyauth
 	if auth == nil {
 		return "", fmt.Errorf("kiro: nil auth")
 	}
+	mu, _ := e.refreshMu.LoadOrStore(auth.ID, &sync.Mutex{})
+	mu.(*sync.Mutex).Lock()
+	defer mu.(*sync.Mutex).Unlock()
+
 	res, err := kiroauth.RefreshIfExpired(ctx, auth.ID, auth.Metadata)
 	if err != nil {
 		return "", err
@@ -857,7 +863,7 @@ func (e *KiroExecutor) doKiroRequest(ctx context.Context, auth *cliproxyauth.Aut
 			AuthType:  authType,
 			AuthValue: authValue,
 		})
-		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 60*time.Second)
 		resp, err := httpClient.Do(httpReq)
 		if err != nil {
 			return nil, err
@@ -1365,6 +1371,6 @@ func (e *KiroExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth,
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 30*time.Second)
 	return httpClient.Do(httpReq)
 }
