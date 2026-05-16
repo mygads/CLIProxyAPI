@@ -487,7 +487,6 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -498,12 +497,8 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	}
 	framer := &responsesSSEFramer{}
 
-	// Commit headers + heartbeat early so the proxy chain (Cloudflare,
-	// nginx) sees activity before upstream emits its first chunk. Long
-	// Kiro generations have observed TTFB > 100s, past CF's
-	// proxy_read_timeout, surfacing as 524 to the client.
 	setSSEHeaders()
-	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	c.Status(http.StatusOK)
 	_, _ = c.Writer.Write([]byte(": connected " + strings.Repeat("-", 2048) + "\n\n"))
 	flusher.Flush()
 
@@ -511,6 +506,42 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	if keepAliveInterval <= 0 {
 		keepAliveInterval = 30 * time.Second
 	}
+
+	type bootstrapResult struct {
+		dataChan <-chan []byte
+		headers  http.Header
+		errChan  <-chan *interfaces.ErrorMessage
+	}
+	bootstrap := make(chan bootstrapResult, 1)
+	go func() {
+		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+		bootstrap <- bootstrapResult{dataChan: dataChan, headers: upstreamHeaders, errChan: errChan}
+	}()
+
+	bootstrapTicker := time.NewTicker(keepAliveInterval)
+	var dataChan <-chan []byte
+	var upstreamHeaders http.Header
+	var errChan <-chan *interfaces.ErrorMessage
+bootstrapLoop:
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			bootstrapTicker.Stop()
+			cliCancel(c.Request.Context().Err())
+			return
+		case <-bootstrapTicker.C:
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
+		case res := <-bootstrap:
+			dataChan = res.dataChan
+			upstreamHeaders = res.headers
+			errChan = res.errChan
+			break bootstrapLoop
+		}
+	}
+	bootstrapTicker.Stop()
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+
 	keepAliveTicker := time.NewTicker(keepAliveInterval)
 	defer keepAliveTicker.Stop()
 

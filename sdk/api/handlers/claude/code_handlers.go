@@ -229,7 +229,6 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	// This allows proper cleanup and cancellation of ongoing requests
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
@@ -238,12 +237,14 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		c.Header("X-Accel-Buffering", "no")
 	}
 
-	// Commit headers + heartbeat early so the proxy chain (Cloudflare,
-	// nginx) sees activity before upstream emits its first chunk. Long
-	// Kiro / CodeWhisperer generations have observed TTFB > 100s, past
-	// CF's proxy_read_timeout, surfacing as 524 to the client.
+	// Commit headers + heartbeat NOW, before the (synchronous) call to
+	// ExecuteStreamWithAuthManager, which blocks until the upstream
+	// HTTP POST has returned its first event-stream chunk. On long Kiro
+	// generations that wait can run past 90s, past Cloudflare's
+	// proxy_read_timeout, surfacing to the client as HTTP 524 even
+	// though origin is healthy.
 	setSSEHeaders()
-	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	c.Status(http.StatusOK)
 	_, _ = c.Writer.Write([]byte(": connected " + strings.Repeat("-", 2048) + "\n\n"))
 	flusher.Flush()
 
@@ -251,6 +252,47 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	if keepAliveInterval <= 0 {
 		keepAliveInterval = 30 * time.Second
 	}
+
+	// Run ExecuteStreamWithAuthManager in a goroutine so the request
+	// thread can keep the connection warm with periodic heartbeats
+	// until the channels become available.
+	type bootstrapResult struct {
+		dataChan  <-chan []byte
+		headers   http.Header
+		errChan   <-chan *interfaces.ErrorMessage
+	}
+	bootstrap := make(chan bootstrapResult, 1)
+	go func() {
+		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+		bootstrap <- bootstrapResult{dataChan: dataChan, headers: upstreamHeaders, errChan: errChan}
+	}()
+
+	bootstrapTicker := time.NewTicker(keepAliveInterval)
+	var dataChan <-chan []byte
+	var upstreamHeaders http.Header
+	var errChan <-chan *interfaces.ErrorMessage
+
+bootstrapLoop:
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			bootstrapTicker.Stop()
+			cliCancel(c.Request.Context().Err())
+			return
+		case <-bootstrapTicker.C:
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
+		case res := <-bootstrap:
+			dataChan = res.dataChan
+			upstreamHeaders = res.headers
+			errChan = res.errChan
+			break bootstrapLoop
+		}
+	}
+	bootstrapTicker.Stop()
+
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+
 	keepAliveTicker := time.NewTicker(keepAliveInterval)
 	defer keepAliveTicker.Stop()
 

@@ -482,39 +482,65 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
-		// Disable proxy response buffering (nginx, Cloudflare workers,
-		// some CDNs respect this hint). Without it the early
-		// ": connected" heartbeat may be held until the buffer fills,
-		// which defeats the whole point of an early flush.
 		c.Header("X-Accel-Buffering", "no")
 	}
 
-	// Commit SSE headers immediately and flush a no-op heartbeat so the
-	// proxy chain (Cloudflare, nginx, ...) sees activity right away.
-	// Without this the connection stays silent until upstream emits its
-	// first chunk; long Kiro / CodeWhisperer generations have observed
-	// TTFB > 100s, which is past Cloudflare's proxy_read_timeout window
-	// and surfaces to clients as a 524.
+	// Commit SSE headers + heartbeat NOW, before the synchronous call
+	// to ExecuteStreamWithAuthManager (which only returns once the
+	// upstream HTTP POST has produced its first chunk; on long Kiro
+	// generations that wait can run past 90s, past CF proxy_read_timeout
+	// → HTTP 524 to the client).
 	setSSEHeaders()
-	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	// 2 KiB padding nudges intermediate proxies that hold output until
-	// their internal buffer fills. The line is a SSE comment so clients
-	// ignore it; it never reaches the SDK consumer.
+	c.Status(http.StatusOK)
 	_, _ = c.Writer.Write([]byte(": connected " + strings.Repeat("-", 2048) + "\n\n"))
 	flusher.Flush()
-	headersCommitted := true
 
 	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
 	if keepAliveInterval <= 0 {
 		keepAliveInterval = 30 * time.Second
 	}
+
+	type bootstrapResult struct {
+		dataChan <-chan []byte
+		headers  http.Header
+		errChan  <-chan *interfaces.ErrorMessage
+	}
+	bootstrap := make(chan bootstrapResult, 1)
+	go func() {
+		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
+		bootstrap <- bootstrapResult{dataChan: dataChan, headers: upstreamHeaders, errChan: errChan}
+	}()
+
+	bootstrapTicker := time.NewTicker(keepAliveInterval)
+	var dataChan <-chan []byte
+	var upstreamHeaders http.Header
+	var errChan <-chan *interfaces.ErrorMessage
+bootstrapLoop:
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			bootstrapTicker.Stop()
+			cliCancel(c.Request.Context().Err())
+			return
+		case <-bootstrapTicker.C:
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
+		case res := <-bootstrap:
+			dataChan = res.dataChan
+			upstreamHeaders = res.headers
+			errChan = res.errChan
+			break bootstrapLoop
+		}
+	}
+	bootstrapTicker.Stop()
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+
 	keepAliveTicker := time.NewTicker(keepAliveInterval)
 	defer keepAliveTicker.Stop()
 
@@ -559,7 +585,6 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 
 			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
 			flusher.Flush()
-			_ = headersCommitted
 
 			// Continue streaming the rest
 			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
@@ -622,7 +647,6 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 
 	modelName := gjson.GetBytes(chatCompletionsJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, chatCompletionsJSON, "")
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -632,12 +656,8 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 		c.Header("X-Accel-Buffering", "no")
 	}
 
-	// Commit headers + heartbeat early so the proxy chain (Cloudflare,
-	// nginx) sees activity before upstream emits its first chunk. Long
-	// Kiro generations have observed TTFB > 100s, past CF's
-	// proxy_read_timeout, surfacing as 524 to the client.
 	setSSEHeaders()
-	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	c.Status(http.StatusOK)
 	_, _ = c.Writer.Write([]byte(": connected " + strings.Repeat("-", 2048) + "\n\n"))
 	flusher.Flush()
 
@@ -645,6 +665,42 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 	if keepAliveInterval <= 0 {
 		keepAliveInterval = 30 * time.Second
 	}
+
+	type bootstrapResult struct {
+		dataChan <-chan []byte
+		headers  http.Header
+		errChan  <-chan *interfaces.ErrorMessage
+	}
+	bootstrap := make(chan bootstrapResult, 1)
+	go func() {
+		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, chatCompletionsJSON, "")
+		bootstrap <- bootstrapResult{dataChan: dataChan, headers: upstreamHeaders, errChan: errChan}
+	}()
+
+	bootstrapTicker := time.NewTicker(keepAliveInterval)
+	var dataChan <-chan []byte
+	var upstreamHeaders http.Header
+	var errChan <-chan *interfaces.ErrorMessage
+bootstrapLoop:
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			bootstrapTicker.Stop()
+			cliCancel(c.Request.Context().Err())
+			return
+		case <-bootstrapTicker.C:
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
+		case res := <-bootstrap:
+			dataChan = res.dataChan
+			upstreamHeaders = res.headers
+			errChan = res.errChan
+			break bootstrapLoop
+		}
+	}
+	bootstrapTicker.Stop()
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+
 	keepAliveTicker := time.NewTicker(keepAliveInterval)
 	defer keepAliveTicker.Stop()
 
