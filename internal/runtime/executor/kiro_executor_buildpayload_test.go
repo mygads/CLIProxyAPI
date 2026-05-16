@@ -331,3 +331,47 @@ func TestBuildKiroPayload_ImageBase64Forwarded(t *testing.T) {
 		t.Errorf("image bytes: got %q", bytes)
 	}
 }
+
+// Regression: the OpenAI->Claude translator hard-rejects any chunk that
+// does not start with "data:" and only emits message_stop when the
+// terminating chunk carries a non-null usage block. Both invariants must
+// be honored by the helpers Kiro's stream path uses.
+func TestBuildSSEChunk_HasDataPrefix(t *testing.T) {
+	chunk := buildSSEChunk("id-1", 1700000000, "claude-opus-4.6", map[string]any{"role": "assistant"}, "")
+	if !strings.HasPrefix(string(chunk), "data: ") {
+		t.Fatalf("buildSSEChunk missing 'data: ' prefix: %q", string(chunk))
+	}
+}
+
+func TestBuildSSEChunkWithUsage_FinalChunkCarriesUsage(t *testing.T) {
+	usage := map[string]any{
+		"prompt_tokens":     int64(10),
+		"completion_tokens": int64(5),
+		"total_tokens":      int64(15),
+	}
+	chunk := buildSSEChunkWithUsage("id-2", 1700000000, "claude-opus-4.6", nil, "tool_calls", usage)
+	if !strings.HasPrefix(string(chunk), "data: ") {
+		t.Fatalf("missing 'data: ' prefix: %q", string(chunk))
+	}
+	// Strip the SSE prefix and decode the payload.
+	body := strings.TrimPrefix(string(chunk), "data: ")
+	var got map[string]any
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	gotUsage, ok := got["usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("final chunk missing usage: %#v", got)
+	}
+	if v, _ := gotUsage["total_tokens"].(float64); v != 15 {
+		t.Errorf("total_tokens: got %v", gotUsage["total_tokens"])
+	}
+	choices, _ := got["choices"].([]any)
+	if len(choices) != 1 {
+		t.Fatalf("expected 1 choice, got %#v", choices)
+	}
+	choice := choices[0].(map[string]any)
+	if reason, _ := choice["finish_reason"].(string); reason != "tool_calls" {
+		t.Errorf("finish_reason: got %q want tool_calls", reason)
+	}
+}

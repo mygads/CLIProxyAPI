@@ -1226,6 +1226,12 @@ func streamKiroResponseAsOpenAI(
 		finishReason = "tool_calls"
 	}
 
+	// Build the usage block once so it can travel both to the reporter
+	// and on the final SSE chunk. The OpenAI->Claude translator only
+	// emits message_delta + message_stop when the terminating chunk
+	// carries a non-null usage; without it the Claude client never sees
+	// the stream close, which surfaces as truncated tool_use blocks.
+	var finalUsage map[string]any
 	if state.usage != nil {
 		reporter.Publish(ctx, cliproxyusage.Detail{
 			InputTokens:         state.usage.InputTokens,
@@ -1234,6 +1240,17 @@ func streamKiroResponseAsOpenAI(
 			CacheCreationTokens: state.usage.CacheCreationTokens,
 			TotalTokens:         state.usage.InputTokens + state.usage.OutputTokens,
 		})
+		finalUsage = map[string]any{
+			"prompt_tokens":     state.usage.InputTokens,
+			"completion_tokens": state.usage.OutputTokens,
+			"total_tokens":      state.usage.InputTokens + state.usage.OutputTokens,
+		}
+		if state.usage.CacheReadTokens > 0 || state.usage.CacheCreationTokens > 0 {
+			finalUsage["prompt_tokens_details"] = map[string]any{
+				"cached_tokens":         state.usage.CacheReadTokens,
+				"cache_creation_tokens": state.usage.CacheCreationTokens,
+			}
+		}
 	} else {
 		promptEst := estimateTokensFromContent(translatedRequest)
 		completionEst := int64(state.content.Len()+state.reasoning.Len()) / 4
@@ -1245,16 +1262,36 @@ func streamKiroResponseAsOpenAI(
 			OutputTokens: completionEst,
 			TotalTokens:  promptEst + completionEst,
 		})
+		finalUsage = map[string]any{
+			"prompt_tokens":     promptEst,
+			"completion_tokens": completionEst,
+			"total_tokens":      promptEst + completionEst,
+		}
 	}
 
-	emit(buildSSEChunk(streamID, now, model, nil, finishReason))
-	emit([]byte("[DONE]"))
+	emit(buildSSEChunkWithUsage(streamID, now, model, nil, finishReason, finalUsage))
+	// IMPORTANT: the [DONE] sentinel must be emitted with the SSE
+	// "data: " prefix. The OpenAI->Claude translator hard-rejects any
+	// chunk that does not start with "data:", which would silently drop
+	// our terminator and leave the Anthropic-shape stream without a
+	// message_stop. That is the failure mode that surfaces to clients
+	// (Claude Code) as a truncated tool_use block / "Write failed".
+	emit([]byte("data: [DONE]"))
 }
 
 // buildSSEChunk constructs one `data: {...}` event body in OpenAI
 // chat.completion.chunk shape. delta is the per-chunk payload (role,
 // content). finishReason is set only on the terminating chunk.
 func buildSSEChunk(id string, created int64, model string, delta map[string]any, finishReason string) []byte {
+	return buildSSEChunkWithUsage(id, created, model, delta, finishReason, nil)
+}
+
+// buildSSEChunkWithUsage is the same as buildSSEChunk but also embeds a
+// top-level "usage" object — required on the terminating chunk so the
+// downstream OpenAI->Claude translator emits message_delta + message_stop.
+// Without usage on the final chunk, Anthropic-shape clients (Claude Code)
+// see the stream close mid-tool-use and report "Write failed".
+func buildSSEChunkWithUsage(id string, created int64, model string, delta map[string]any, finishReason string, usage map[string]any) []byte {
 	choice := map[string]any{"index": 0}
 	if delta != nil {
 		choice["delta"] = delta
@@ -1270,6 +1307,9 @@ func buildSSEChunk(id string, created int64, model string, delta map[string]any,
 		"created": created,
 		"model":   model,
 		"choices": []any{choice},
+	}
+	if usage != nil {
+		payload["usage"] = usage
 	}
 	b, _ := json.Marshal(payload)
 	return append([]byte("data: "), b...)
