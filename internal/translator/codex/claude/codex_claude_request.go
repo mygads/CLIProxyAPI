@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -52,7 +53,7 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 		contentIndex := 0
 
 		appendSystemText := func(text string) {
-			if text == "" || strings.HasPrefix(text, "x-anthropic-billing-header: ") {
+			if text == "" || util.IsClaudeCodeAttributionSystemText(text) {
 				return
 			}
 
