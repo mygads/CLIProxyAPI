@@ -190,6 +190,25 @@ func IsOAuthSessionPending(state, provider string) bool {
 	return oauthSessions.IsPending(state, provider)
 }
 
+// oauthSessionErrorWithCause formats an OAuth session error message with an
+// optional underlying error appended. Used by callbacks (e.g. xAI PKCE flow)
+// to surface the upstream cause to the management UI without leaking nil
+// errors or empty strings.
+func oauthSessionErrorWithCause(message string, cause error) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "Authentication failed"
+	}
+	if cause == nil {
+		return message
+	}
+	detail := strings.TrimSpace(cause.Error())
+	if detail == "" {
+		return message
+	}
+	return message + ": " + detail
+}
+
 func ValidateOAuthState(state string) error {
 	trimmed := strings.TrimSpace(state)
 	if trimmed == "" {
@@ -248,6 +267,8 @@ func NormalizeOAuthProvider(provider string) (string, error) {
 		// OAuth handshake. NormalizeOAuthProvider still accepts the key
 		// so the generic loader wires the credential correctly.
 		return "cursor", nil
+	case "xai", "x-ai", "x.ai", "grok":
+		return "xai", nil
 	default:
 		return "", errUnsupportedOAuthFlow
 	}

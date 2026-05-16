@@ -21,6 +21,7 @@ type staticModelsJSON struct {
 	CodexPro    []*ModelInfo `json:"codex-pro"`
 	Kimi        []*ModelInfo `json:"kimi"`
 	Antigravity []*ModelInfo `json:"antigravity"`
+	XAI         []*ModelInfo `json:"xai"`
 }
 
 // GetClaudeModels returns the standard Claude model definitions.
@@ -475,7 +476,8 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 //   - cline
 //   - kilocode
 //   - cursor
-//   - groq, xai, mistral, cloudflare-ai, deepseek, openrouter, fireworks,
+//   - xai
+//   - groq, mistral, cloudflare-ai, deepseek, openrouter, fireworks,
 //     cerebras, cohere, together, ollama, perplexity, glm, kimi-apikey,
 //     siliconflow, hyperbolic
 func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
@@ -511,7 +513,7 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetCursorModels()
 	case "groq":
 		return GetGroqModels()
-	case "xai":
+	case "xai", "x-ai", "grok":
 		return GetXAIModels()
 	case "mistral":
 		return GetMistralModels()
