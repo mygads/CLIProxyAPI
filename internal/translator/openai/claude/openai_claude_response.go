@@ -55,11 +55,19 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	NextContentBlockIndex int
 }
 
-// ToolCallAccumulator holds the state for accumulating tool call data
+// ToolCallAccumulator holds the state for accumulating tool call data.
+//
+// EmittedArgsLen tracks how many bytes of Arguments have already been
+// forwarded to the client as partial_json deltas, so the terminating
+// flush only sends what is left. Streaming the deltas as they arrive
+// (instead of buffering until finish_reason) lets Anthropic-shape
+// clients render long tool args progressively and keeps long-running
+// tool calls under the 100s Cloudflare proxy-read window.
 type ToolCallAccumulator struct {
-	ID        string
-	Name      string
-	Arguments strings.Builder
+	ID             string
+	Name           string
+	Arguments      strings.Builder
+	EmittedArgsLen int
 }
 
 // ConvertOpenAIResponseToClaude converts OpenAI streaming response format to Anthropic API format.
@@ -252,11 +260,20 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 						results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_start", contentBlockStartJSONBytes, 2))
 					}
 
-					// Handle function arguments
+					// Handle function arguments — stream each delta as it
+					// arrives so long tool args do not block until
+					// finish_reason. EmittedArgsLen tracks how much of
+					// the buffer has already been sent so the closing
+					// flush only emits the remainder.
 					if args := function.Get("arguments"); args.Exists() {
 						argsText := args.String()
 						if argsText != "" {
 							accumulator.Arguments.WriteString(argsText)
+							inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
+							inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
+							inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", argsText)
+							results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
+							accumulator.EmittedArgsLen += len(argsText)
 						}
 					}
 				}
@@ -293,12 +310,21 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 				accumulator := param.ToolCallsAccumulator[index]
 				blockIndex := param.toolContentBlockIndex(index)
 
-				// Send complete input_json_delta with all accumulated arguments
-				if accumulator.Arguments.Len() > 0 {
-					inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
-					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
-					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", util.FixJSON(accumulator.Arguments.String()))
-					results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
+				// Flush any tail of the accumulated arguments that has
+				// not been streamed yet. With incremental delta emission
+				// this is usually empty, but the safety net protects
+				// against providers that ship the full args only on the
+				// terminating chunk (e.g. our own non-streaming fallback).
+				accumulated := accumulator.Arguments.String()
+				if accumulator.EmittedArgsLen < len(accumulated) {
+					tail := accumulated[accumulator.EmittedArgsLen:]
+					if tail != "" {
+						inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
+						inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
+						inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", util.FixJSON(tail))
+						results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
+						accumulator.EmittedArgsLen = len(accumulated)
+					}
 				}
 
 				contentBlockStopJSON := []byte(`{"type":"content_block_stop","index":0}`)
@@ -357,11 +383,16 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 			accumulator := param.ToolCallsAccumulator[index]
 			blockIndex := param.toolContentBlockIndex(index)
 
-			if accumulator.Arguments.Len() > 0 {
-				inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
-				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
-				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", util.FixJSON(accumulator.Arguments.String()))
-				results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
+			accumulated := accumulator.Arguments.String()
+			if accumulator.EmittedArgsLen < len(accumulated) {
+				tail := accumulated[accumulator.EmittedArgsLen:]
+				if tail != "" {
+					inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
+					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
+					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", util.FixJSON(tail))
+					results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
+					accumulator.EmittedArgsLen = len(accumulated)
+				}
 			}
 
 			contentBlockStopJSON := []byte(`{"type":"content_block_stop","index":0}`)
