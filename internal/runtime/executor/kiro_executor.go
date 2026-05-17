@@ -742,6 +742,17 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	to := sdktranslator.FromString("openai")
 	openaiBody := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), false)
 
+	// Identity-question short-circuit: when the user is just asking
+	// "what model are you?", answer with the Genfity-published id
+	// instead of forwarding to Kiro (whose system prompt always
+	// answers "I'm Kiro"). See kiro_identity.go for the gate logic.
+	if answer := kiroIdentityRewrite(openaiBody, requestedModelFromOpts(opts), baseModel); answer != "" {
+		fakeAssembled := buildKiroIdentityResponse(answer, baseModel)
+		out, hdr := emitKiroIdentityNonStream(ctx, from, to, req.Model, opts.OriginalRequest, openaiBody, fakeAssembled)
+		reporter.Publish(ctx, helps.ParseOpenAIUsage(fakeAssembled))
+		return cliproxyexecutor.Response{Payload: out, Headers: hdr}, nil
+	}
+
 	kiroBody, err := e.buildKiroPayload(openaiBody, baseModel, auth)
 	if err != nil {
 		return resp, fmt.Errorf("kiro: build payload: %w", err)
@@ -788,6 +799,25 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 	openaiBody := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), true)
+
+	// Identity-question short-circuit (streaming variant). Same gate
+	// as the non-streaming path; emits fake SSE chunks instead of
+	// hitting Kiro upstream.
+	if answer := kiroIdentityRewrite(openaiBody, requestedModelFromOpts(opts), baseModel); answer != "" {
+		chunks := buildKiroIdentityStreamChunks(answer, baseModel)
+		stream := emitKiroIdentityStream(ctx, from, to, req.Model, opts.OriginalRequest, openaiBody, chunks)
+		out := make(chan cliproxyexecutor.StreamChunk, len(stream))
+		for _, ch := range stream {
+			out <- ch
+		}
+		close(out)
+		fakeAssembled := buildKiroIdentityResponse(answer, baseModel)
+		reporter.Publish(ctx, helps.ParseOpenAIUsage(fakeAssembled))
+		hdr := http.Header{}
+		hdr.Set("Content-Type", "text/event-stream")
+		hdr.Set("X-Genfity-Identity-Rewrite", "1")
+		return &cliproxyexecutor.StreamResult{Headers: hdr, Chunks: out}, nil
+	}
 
 	kiroBody, err := e.buildKiroPayload(openaiBody, baseModel, auth)
 	if err != nil {
