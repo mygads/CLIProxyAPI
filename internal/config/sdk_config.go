@@ -4,6 +4,8 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
+import "time"
+
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
@@ -52,6 +54,20 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+
+	// UpstreamTimeoutSeconds sets the HTTP client timeout for requests to upstream AI providers.
+	// Applies to all executors (Kiro, Claude, OpenAI-compat, Gemini, etc.).
+	// Default is 180 seconds. Set to 0 for no timeout (not recommended).
+	UpstreamTimeoutSeconds int `yaml:"upstream-timeout-seconds,omitempty" json:"upstream-timeout-seconds,omitempty"`
+}
+
+// UpstreamTimeout returns the configured upstream timeout duration.
+// Defaults to 300s (5 minutes) if not set or zero.
+func (c *SDKConfig) UpstreamTimeout() time.Duration {
+	if c == nil || c.UpstreamTimeoutSeconds <= 0 {
+		return 300 * time.Second
+	}
+	return time.Duration(c.UpstreamTimeoutSeconds) * time.Second
 }
 
 // StreamingConfig holds server streaming behavior configuration.

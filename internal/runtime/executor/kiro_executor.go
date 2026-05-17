@@ -863,7 +863,7 @@ func (e *KiroExecutor) doKiroRequest(ctx context.Context, auth *cliproxyauth.Aut
 			AuthType:  authType,
 			AuthValue: authValue,
 		})
-		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 60*time.Second)
+		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, e.cfg.UpstreamTimeout())
 		resp, err := httpClient.Do(httpReq)
 		if err != nil {
 			return nil, err

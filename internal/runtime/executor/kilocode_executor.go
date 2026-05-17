@@ -110,7 +110,7 @@ func (e *KiloCodeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.A
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, e.cfg.UpstreamTimeout())
 	return httpClient.Do(httpReq)
 }
 
@@ -275,7 +275,7 @@ func (e *KiloCodeExecutor) doKiloCodeRequest(ctx context.Context, auth *cliproxy
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, e.cfg.UpstreamTimeout())
 	return httpClient.Do(httpReq)
 }
 

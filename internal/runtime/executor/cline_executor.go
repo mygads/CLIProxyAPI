@@ -158,7 +158,7 @@ func (e *ClineExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, e.cfg.UpstreamTimeout())
 	return httpClient.Do(httpReq)
 }
 
@@ -328,7 +328,7 @@ func (e *ClineExecutor) doClineRequest(ctx context.Context, auth *cliproxyauth.A
 			AuthType:  authType,
 			AuthValue: authValue,
 		})
-		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, e.cfg.UpstreamTimeout())
 		resp, err := httpClient.Do(httpReq)
 		if err != nil {
 			return nil, err
