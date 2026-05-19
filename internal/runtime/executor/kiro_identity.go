@@ -37,19 +37,14 @@ import (
 )
 
 // identityModelLabel translates Kiro upstream model ids to the public
-// label that should appear in the answer. Falls back to a generic
-// "Genfity AI" when the underlying model isn't in our catalog.
-//
-// Keys are matched lowercase against the `requested_model` (gateway
-// public id like "genfity/auto") OR the executor model id passed via
-// req.Model (which is the upstream id, e.g. "auto", "claude-opus-4.7").
+// label that should appear in the answer. Returns pipe-separated
+// "ModelName|Vendor" format for consistency with combo identity system.
 func identityModelLabel(requested, upstream string) (modelID string, vendor string) {
 	r := strings.ToLower(strings.TrimSpace(requested))
 	u := strings.ToLower(strings.TrimSpace(upstream))
 
 	// Strip prefix from gateway-style ids ("genfity/auto" -> "auto",
-	// "kiro/auto" -> "auto"). The vendor namespace is always Genfity
-	// from the customer's perspective so we don't surface "kiro" here.
+	// "kiro/auto" -> "auto", "kr/claude-opus-4-7" -> "claude-opus-4-7").
 	if i := strings.LastIndex(r, "/"); i >= 0 {
 		r = r[i+1:]
 	}
@@ -59,25 +54,25 @@ func identityModelLabel(requested, upstream string) (modelID string, vendor stri
 		pick = u
 	}
 
-	// Map known model ids to their underlying vendor for honesty in
-	// the answer. The model id we surface is the Genfity-published
-	// alias (matches what the customer copy-pasted into their request).
-	switch pick {
-	case "auto":
-		return "genfity/auto", "Genfity (auto-routed)"
-	case "claude-opus-4-7", "claude-opus-4.7":
-		return "genfity/claude-opus-4.7", "Anthropic via Genfity"
-	case "claude-sonnet-4-5", "claude-sonnet-4.5":
-		return "genfity/claude-sonnet-4.5", "Anthropic via Genfity"
-	case "claude-haiku-4-5", "claude-haiku-4.5":
-		return "genfity/claude-haiku-4.5", "Anthropic via Genfity"
+	// Strip :free / :notools suffixes
+	if i := strings.Index(pick, ":"); i >= 0 {
+		pick = pick[:i]
 	}
 
-	// Unknown — surface whatever the customer asked for, prefixed if
-	// we know it came in via Genfity.
-	if requested != "" {
-		return "genfity/" + pick, "Genfity"
+	switch pick {
+	case "auto":
+		return "Genfity Auto", "Genfity"
+	case "claude-opus-4-7", "claude-opus-4.7":
+		return "Claude Opus 4.7", "Anthropic"
+	case "claude-sonnet-4-6", "claude-sonnet-4.6":
+		return "Claude Sonnet 4.6", "Anthropic"
+	case "claude-sonnet-4-5", "claude-sonnet-4.5":
+		return "Claude Sonnet 4.5", "Anthropic"
+	case "claude-haiku-4-5", "claude-haiku-4.5":
+		return "Claude Haiku 4.5", "Anthropic"
 	}
+
+	// Unknown — surface the pick as-is with a generic vendor.
 	return pick, "Genfity"
 }
 
@@ -166,9 +161,9 @@ func kiroIdentityRewrite(openaiBody []byte, requestedModel, upstreamModel string
 		strings.Contains(lower, "namamu") || strings.Contains(lower, "nama anda")
 
 	if indo {
-		return fmt.Sprintf("Saya adalah %s, model AI yang disediakan oleh %s. Ada yang bisa saya bantu?", modelID, vendor)
+		return fmt.Sprintf("Saya adalah %s, model AI dari %s. Ada yang bisa saya bantu?", modelID, vendor)
 	}
-	return fmt.Sprintf("I'm %s, an AI model served by %s. How can I help?", modelID, vendor)
+	return fmt.Sprintf("I'm %s, an AI model by %s. How can I help?", modelID, vendor)
 }
 
 // requestedModelFromOpts pulls the customer-facing model id out of the

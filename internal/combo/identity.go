@@ -1,0 +1,197 @@
+package combo
+
+import (
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/tidwall/gjson"
+)
+
+// IdentityQuestionRegex matches common shapes of "who/what are you" in
+// English and Indonesian. Tight so casual mentions of "model" inside
+// code-help requests don't match.
+var IdentityQuestionRegex = regexp.MustCompile(`(?i)\b(?:` +
+	// English
+	`who\s+are\s+you|` +
+	`what(?:'s| is)\s+your\s+(?:name|model|model\s+id|identity)|` +
+	`which\s+(?:model|ai|llm)\s+are\s+you|` +
+	`are\s+you\s+(?:gpt|claude|gemini|kiro|llama|chatgpt)|` +
+	`tell\s+me\s+(?:your\s+name|who\s+you\s+are|which\s+model)|` +
+	// Indonesian
+	`siapa(?:kah)?\s+(?:kamu|anda|kau|lu|km)|` +
+	`(?:kamu|anda|km)\s+(?:siapa|model\s+apa)|` +
+	`model(?:\s+apa)?\s+(?:kamu|anda|nya|km)|` +
+	`(?:kamu|anda|km)\s+(?:itu|adalah)?\s*model\s+apa|` +
+	`apa(?:kah)?\s+(?:nama|model|jenis)\s*(?:mu|kamu|anda)|` +
+	`(?:nama|model)\s+(?:mu|kamu|anda)\s+(?:apa|siapa)` +
+	`)\b`)
+
+// ParseDisplayName splits a pipe-separated display name into model name
+// and vendor. Format: "ModelName|Vendor". If no pipe, the entire string
+// is the model name and vendor is empty.
+func ParseDisplayName(displayName string) (modelName, vendor string) {
+	parts := strings.SplitN(displayName, "|", 2)
+	modelName = strings.TrimSpace(parts[0])
+	if len(parts) > 1 {
+		vendor = strings.TrimSpace(parts[1])
+	}
+	return
+}
+
+// IsIdentityQuestion checks whether an OpenAI-format request body
+// contains a single-turn identity question. Returns true only when:
+//   - There is exactly one user turn
+//   - The last message is from the user
+//   - The message text is short (<280 chars) and matches the identity regex
+func IsIdentityQuestion(openaiBody []byte) bool {
+	messages := gjson.GetBytes(openaiBody, "messages").Array()
+	if len(messages) == 0 {
+		return false
+	}
+
+	userTurns := 0
+	for _, m := range messages {
+		if m.Get("role").String() == "user" {
+			userTurns++
+		}
+	}
+	if userTurns != 1 {
+		return false
+	}
+
+	last := messages[len(messages)-1]
+	if last.Get("role").String() != "user" {
+		return false
+	}
+
+	text := extractUserText(last)
+	if text == "" || len(text) > 280 {
+		return false
+	}
+
+	return IdentityQuestionRegex.MatchString(text)
+}
+
+// IsIndonesian returns true when the text contains common Indonesian markers.
+func IsIndonesian(text string) bool {
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "kamu") || strings.Contains(lower, "anda") ||
+		strings.Contains(lower, "siapa") || strings.Contains(lower, "model apa") ||
+		strings.Contains(lower, "namamu") || strings.Contains(lower, "nama anda")
+}
+
+// BuildIdentityAnswer constructs the identity answer string from a
+// pipe-separated display name. Detects language from the request body.
+func BuildIdentityAnswer(displayName string, openaiBody []byte) string {
+	modelName, vendor := ParseDisplayName(displayName)
+	if modelName == "" {
+		return ""
+	}
+
+	// Detect language from last user message
+	messages := gjson.GetBytes(openaiBody, "messages").Array()
+	indo := false
+	if len(messages) > 0 {
+		last := messages[len(messages)-1]
+		text := extractUserText(last)
+		indo = IsIndonesian(text)
+	}
+
+	if vendor == "" {
+		if indo {
+			return fmt.Sprintf("Saya adalah %s. Ada yang bisa saya bantu?", modelName)
+		}
+		return fmt.Sprintf("I'm %s. How can I help?", modelName)
+	}
+
+	if indo {
+		return fmt.Sprintf("Saya adalah %s, model AI dari %s. Ada yang bisa saya bantu?", modelName, vendor)
+	}
+	return fmt.Sprintf("I'm %s, an AI model by %s. How can I help?", modelName, vendor)
+}
+
+// BuildIdentityResponse fabricates an OpenAI chat.completion JSON payload.
+func BuildIdentityResponse(answer string, model string) []byte {
+	completionTokens := int64(len(answer) / 4)
+	if completionTokens < 1 {
+		completionTokens = 1
+	}
+	out := map[string]any{
+		"id":      "chatcmpl-" + uuid.New().String(),
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]any{{
+			"index": 0,
+			"message": map[string]any{
+				"role":    "assistant",
+				"content": answer,
+			},
+			"finish_reason": "stop",
+		}},
+		"usage": map[string]any{
+			"prompt_tokens":     1,
+			"completion_tokens": completionTokens,
+			"total_tokens":      1 + completionTokens,
+		},
+	}
+	body, _ := json.Marshal(out)
+	return body
+}
+
+// BuildIdentityStreamChunks fabricates SSE chunks for a streaming identity response.
+func BuildIdentityStreamChunks(answer string, model string) [][]byte {
+	id := "chatcmpl-" + uuid.New().String()
+	created := time.Now().Unix()
+
+	frame := func(delta map[string]any, finishReason any) []byte {
+		choice := map[string]any{
+			"index": 0,
+			"delta": delta,
+		}
+		if finishReason != nil {
+			choice["finish_reason"] = finishReason
+		} else {
+			choice["finish_reason"] = nil
+		}
+		obj := map[string]any{
+			"id":      id,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []any{choice},
+		}
+		raw, _ := json.Marshal(obj)
+		return []byte("data: " + string(raw) + "\n\n")
+	}
+
+	return [][]byte{
+		frame(map[string]any{"role": "assistant"}, nil),
+		frame(map[string]any{"content": answer}, nil),
+		frame(map[string]any{}, "stop"),
+		[]byte("data: [DONE]\n\n"),
+	}
+}
+
+func extractUserText(msg gjson.Result) string {
+	text := msg.Get("content").String()
+	if text != "" {
+		return strings.TrimSpace(text)
+	}
+	// Multi-modal content array
+	var b strings.Builder
+	msg.Get("content").ForEach(func(_ gjson.Result, part gjson.Result) bool {
+		if part.Get("type").String() == "text" {
+			if b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			b.WriteString(part.Get("text").String())
+		}
+		return true
+	})
+	return strings.TrimSpace(b.String())
+}

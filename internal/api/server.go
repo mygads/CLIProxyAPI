@@ -168,6 +168,13 @@ func (a *comboResolverAdapter) Candidates(name string) ([]handlers.ComboCandidat
 	return out, true
 }
 
+func (a *comboResolverAdapter) DisplayName(name string) string {
+	if a == nil || a.reg == nil {
+		return ""
+	}
+	return a.reg.DisplayName(name)
+}
+
 // ListNames satisfies the optional interface OpenAIModels uses to inject
 // combo names into /v1/models. Without this the type assertion in
 // `sdk/api/handlers/openai/openai_handlers.go` (`h.Combos.(interface{ ListNames() []string })`)

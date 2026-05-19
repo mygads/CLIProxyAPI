@@ -13,7 +13,8 @@ import (
 // lets the fallback tests feed a canned combo chain into BaseAPIHandler
 // without importing internal/combo (which would cycle).
 type fakeComboResolver struct {
-	chains map[string][]ComboCandidate
+	chains       map[string][]ComboCandidate
+	displayNames map[string]string
 }
 
 func (f *fakeComboResolver) Has(name string) bool {
@@ -37,6 +38,13 @@ func (f *fakeComboResolver) Candidates(name string) ([]ComboCandidate, bool) {
 	out := make([]ComboCandidate, len(entries))
 	copy(out, entries)
 	return out, true
+}
+
+func (f *fakeComboResolver) DisplayName(name string) string {
+	if f.displayNames == nil {
+		return ""
+	}
+	return f.displayNames[name]
 }
 
 func TestResolveModelAttempts_nonComboReturnsSingleEntry(t *testing.T) {

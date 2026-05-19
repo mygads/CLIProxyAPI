@@ -40,6 +40,7 @@ const (
 type Combo struct {
 	Name        string         `json:"name" yaml:"name"`
 	Description string         `json:"description,omitempty" yaml:"description,omitempty"`
+	DisplayName string         `json:"display_name,omitempty" yaml:"display_name,omitempty"`
 	Status      Status         `json:"status" yaml:"status"`
 	LoadBalance bool           `json:"load_balance" yaml:"load_balance"`
 	Entries     []Entry        `json:"entries" yaml:"entries"`
@@ -247,6 +248,20 @@ func (r *Registry) Has(name string) bool {
 	_, ok := r.entries[key]
 	r.mu.RUnlock()
 	return ok
+}
+
+// DisplayName returns the display_name for a combo, or "" when the combo
+// is unknown or has no display_name set. Used by the identity intercept
+// to determine whether to short-circuit identity questions.
+func (r *Registry) DisplayName(name string) string {
+	key := strings.ToLower(strings.TrimSpace(name))
+	r.mu.RLock()
+	combo, ok := r.entries[key]
+	r.mu.RUnlock()
+	if !ok || combo == nil {
+		return ""
+	}
+	return combo.DisplayName
 }
 
 // ListNames returns the names of all active combos in sorted order. It is

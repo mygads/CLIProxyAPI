@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/combo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -308,6 +309,9 @@ type ComboResolver interface {
 	// slice + false means the name is not a combo. Callers iterate this
 	// list, stopping on the first success or at the last entry.
 	Candidates(name string) ([]ComboCandidate, bool)
+	// DisplayName returns the pipe-separated display name for a combo
+	// (e.g. "GPT-5.5|OpenAI"). Empty string means no identity intercept.
+	DisplayName(name string) string
 }
 
 // ComboCandidate is one step in a fallback chain returned by
@@ -569,6 +573,13 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	// Identity intercept: if the model is a combo with a DisplayName and
+	// the request is an identity question, short-circuit with a fabricated
+	// response instead of hitting upstream.
+	if resp, hdr := h.tryComboIdentityIntercept(handlerType, modelName, rawJSON); resp != nil {
+		return resp, hdr, nil
+	}
+
 	// Multi-candidate combo fallback. If the requested model is a combo,
 	// resolve the full chain and iterate until one entry succeeds or the
 	// list is exhausted. For single-model requests this collapses to the
@@ -721,6 +732,15 @@ func (h *BaseAPIHandler) executeCountSingle(ctx context.Context, handlerType, mo
 // recovery (auth rotation within the same candidate) still runs and is
 // orthogonal to combo iteration.
 func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	// Identity intercept (streaming): if the model is a combo with a
+	// DisplayName and the request is an identity question, emit fabricated
+	// SSE chunks instead of hitting upstream.
+	if dataChan, hdr := h.tryComboIdentityInterceptStream(handlerType, modelName, rawJSON); dataChan != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		close(errChan)
+		return dataChan, hdr, errChan
+	}
+
 	attempts := h.resolveModelAttempts(modelName)
 	// Single-candidate path skips the buffered indirection so existing
 	// non-combo behaviour stays bit-for-bit identical (header timing,
@@ -1134,6 +1154,88 @@ func (h *BaseAPIHandler) resolveModelAttempts(modelName string) []modelAttempt {
 
 	// Not a combo — treat as a plain prefixed model (e.g. "kr/auto").
 	return []modelAttempt{{Model: modelName, IsLast: true}}
+}
+
+// tryComboIdentityIntercept checks whether the request is an identity
+// question targeting a combo with a DisplayName. If so, it returns a
+// fabricated non-streaming response. Returns (nil, nil) to let the
+// request flow normally.
+func (h *BaseAPIHandler) tryComboIdentityIntercept(handlerType, modelName string, rawJSON []byte) ([]byte, http.Header) {
+	if h == nil || h.Combos == nil {
+		return nil, nil
+	}
+	displayName := h.Combos.DisplayName(modelName)
+	if displayName == "" {
+		return nil, nil
+	}
+	// Translate to OpenAI format for identity detection (source may be
+	// claude/gemini/etc). Identity check needs messages in OpenAI shape.
+	from := sdktranslator.FromString(handlerType)
+	to := sdktranslator.FromString("openai")
+	openaiBody := sdktranslator.TranslateRequest(from, to, modelName, rawJSON, false)
+
+	if !combo.IsIdentityQuestion(openaiBody) {
+		return nil, nil
+	}
+
+	answer := combo.BuildIdentityAnswer(displayName, openaiBody)
+	if answer == "" {
+		return nil, nil
+	}
+
+	fakeResp := combo.BuildIdentityResponse(answer, modelName)
+
+	// Translate back to the caller's format.
+	var param any
+	out := sdktranslator.TranslateNonStream(context.Background(), to, from, modelName, rawJSON, openaiBody, fakeResp, &param)
+
+	hdr := http.Header{}
+	hdr.Set("Content-Type", "application/json")
+	hdr.Set("X-Genfity-Identity-Rewrite", "1")
+	return out, hdr
+}
+
+// tryComboIdentityInterceptStream is the streaming variant of
+// tryComboIdentityIntercept. Returns a channel of SSE chunks when
+// intercepted, or (nil, nil) to let the request flow normally.
+func (h *BaseAPIHandler) tryComboIdentityInterceptStream(handlerType, modelName string, rawJSON []byte) (<-chan []byte, http.Header) {
+	if h == nil || h.Combos == nil {
+		return nil, nil
+	}
+	displayName := h.Combos.DisplayName(modelName)
+	if displayName == "" {
+		return nil, nil
+	}
+	from := sdktranslator.FromString(handlerType)
+	to := sdktranslator.FromString("openai")
+	openaiBody := sdktranslator.TranslateRequest(from, to, modelName, rawJSON, true)
+
+	if !combo.IsIdentityQuestion(openaiBody) {
+		return nil, nil
+	}
+
+	answer := combo.BuildIdentityAnswer(displayName, openaiBody)
+	if answer == "" {
+		return nil, nil
+	}
+
+	chunks := combo.BuildIdentityStreamChunks(answer, modelName)
+
+	// Translate each chunk to the caller's format.
+	var param any
+	dataChan := make(chan []byte, len(chunks)*2)
+	for _, raw := range chunks {
+		lines := sdktranslator.TranslateStream(context.Background(), to, from, modelName, rawJSON, openaiBody, raw, &param)
+		for _, ln := range lines {
+			dataChan <- ln
+		}
+	}
+	close(dataChan)
+
+	hdr := http.Header{}
+	hdr.Set("Content-Type", "text/event-stream")
+	hdr.Set("X-Genfity-Identity-Rewrite", "1")
+	return dataChan, hdr
 }
 
 // comboShouldFallback reports whether an error from one combo candidate

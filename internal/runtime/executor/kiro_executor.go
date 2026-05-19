@@ -747,7 +747,10 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	// instead of forwarding to Kiro (whose system prompt always
 	// answers "I'm Kiro"). See kiro_identity.go for the gate logic.
 	if answer := kiroIdentityRewrite(openaiBody, requestedModelFromOpts(opts), baseModel); answer != "" {
-		fakeAssembled := buildKiroIdentityResponse(answer, baseModel)
+		// Use req.Model (the prefixed customer-facing name like
+		// "kr/claude-opus-4-7") in the response so the model field
+		// echoes what the caller sent, not the upstream id.
+		fakeAssembled := buildKiroIdentityResponse(answer, req.Model)
 		out, hdr := emitKiroIdentityNonStream(ctx, from, to, req.Model, opts.OriginalRequest, openaiBody, fakeAssembled)
 		reporter.Publish(ctx, helps.ParseOpenAIUsage(fakeAssembled))
 		return cliproxyexecutor.Response{Payload: out, Headers: hdr}, nil
@@ -804,14 +807,14 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	// as the non-streaming path; emits fake SSE chunks instead of
 	// hitting Kiro upstream.
 	if answer := kiroIdentityRewrite(openaiBody, requestedModelFromOpts(opts), baseModel); answer != "" {
-		chunks := buildKiroIdentityStreamChunks(answer, baseModel)
+		chunks := buildKiroIdentityStreamChunks(answer, req.Model)
 		stream := emitKiroIdentityStream(ctx, from, to, req.Model, opts.OriginalRequest, openaiBody, chunks)
 		out := make(chan cliproxyexecutor.StreamChunk, len(stream))
 		for _, ch := range stream {
 			out <- ch
 		}
 		close(out)
-		fakeAssembled := buildKiroIdentityResponse(answer, baseModel)
+		fakeAssembled := buildKiroIdentityResponse(answer, req.Model)
 		reporter.Publish(ctx, helps.ParseOpenAIUsage(fakeAssembled))
 		hdr := http.Header{}
 		hdr.Set("Content-Type", "text/event-stream")
