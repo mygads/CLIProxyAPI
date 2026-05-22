@@ -687,6 +687,16 @@ func parseKiroToolInput(v gjson.Result) any {
 	return map[string]any{}
 }
 
+// isKiroRetriableBody returns true when a Kiro 400 response indicates a
+// per-account model availability issue rather than a genuinely malformed
+// request. These errors should trigger a retry with a different account.
+func isKiroRetriableBody(body []byte) bool {
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, "improperly formed request") ||
+		strings.Contains(lower, "you have reached the limit") ||
+		strings.Contains(lower, "invalid model")
+}
+
 func orFallback(s, fallback string) string {
 	if s == "" {
 		return fallback
@@ -775,7 +785,11 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		return resp, statusErr{code: httpResp.StatusCode, msg: string(b)}
+		code := httpResp.StatusCode
+		if code == 400 && isKiroRetriableBody(b) {
+			code = http.StatusServiceUnavailable
+		}
+		return resp, statusErr{code: code, msg: string(b)}
 	}
 
 	assembled, err := assembleKiroResponse(ctx, e.cfg, httpResp.Body, baseModel, openaiBody)
@@ -839,7 +853,11 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("kiro executor: close body: %v", errClose)
 		}
-		return nil, statusErr{code: httpResp.StatusCode, msg: string(b)}
+		code := httpResp.StatusCode
+		if code == 400 && isKiroRetriableBody(b) {
+			code = http.StatusServiceUnavailable
+		}
+		return nil, statusErr{code: code, msg: string(b)}
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
