@@ -62,14 +62,7 @@ func newModelCooldownError(model, provider string, resetIn time.Duration) *model
 }
 
 func (e *modelCooldownError) Error() string {
-	modelName := e.model
-	if modelName == "" {
-		modelName = "requested model"
-	}
-	message := fmt.Sprintf("All credentials for model %s are cooling down", modelName)
-	if e.provider != "" {
-		message = fmt.Sprintf("%s via provider %s", message, e.provider)
-	}
+	message := "All credentials for the requested model are cooling down. Please retry shortly."
 	resetSeconds := int(math.Ceil(e.resetIn.Seconds()))
 	if resetSeconds < 0 {
 		resetSeconds = 0
@@ -83,12 +76,8 @@ func (e *modelCooldownError) Error() string {
 	errorBody := map[string]any{
 		"code":          "model_cooldown",
 		"message":       message,
-		"model":         e.model,
 		"reset_time":    displayDuration.String(),
 		"reset_seconds": resetSeconds,
-	}
-	if e.provider != "" {
-		errorBody["provider"] = e.provider
 	}
 	payload := map[string]any{"error": errorBody}
 	data, err := json.Marshal(payload)

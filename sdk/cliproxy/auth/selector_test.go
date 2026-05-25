@@ -255,7 +255,7 @@ func TestSelectorPick_AllCooldownReturnsModelCooldownError(t *testing.T) {
 		}
 	})
 
-	t.Run("non-mixed provider includes provider field", func(t *testing.T) {
+	t.Run("non-mixed provider does NOT expose provider field", func(t *testing.T) {
 		t.Parallel()
 
 		selector := &FillFirstSelector{}
@@ -277,8 +277,11 @@ func TestSelectorPick_AllCooldownReturnsModelCooldownError(t *testing.T) {
 		if !ok {
 			t.Fatalf("Error() payload missing error object: %v", payload)
 		}
-		if got, _ := rawErr["provider"].(string); got != "gemini" {
-			t.Fatalf("Error().error.provider = %q, want %q", got, "gemini")
+		if _, ok := rawErr["provider"]; ok {
+			t.Fatalf("Error().error.provider should not be exposed to customers, got: %v", rawErr["provider"])
+		}
+		if _, ok := rawErr["model"]; ok {
+			t.Fatalf("Error().error.model should not be exposed to customers, got: %v", rawErr["model"])
 		}
 	})
 }

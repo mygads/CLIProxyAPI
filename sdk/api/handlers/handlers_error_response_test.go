@@ -80,14 +80,18 @@ func TestEnrichAuthSelectionError_DefaultsTo503WithContext(t *testing.T) {
 	if got.StatusCode() != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", got.StatusCode(), http.StatusServiceUnavailable)
 	}
-	if !strings.Contains(got.Message, "providers=claude") {
-		t.Fatalf("message missing provider context: %q", got.Message)
+	// Must NOT expose internal provider/model/management details to customers.
+	if strings.Contains(got.Message, "providers=") {
+		t.Fatalf("message leaks provider context: %q", got.Message)
 	}
-	if !strings.Contains(got.Message, "model=claude-sonnet-4-6") {
-		t.Fatalf("message missing model context: %q", got.Message)
+	if strings.Contains(got.Message, "model=") {
+		t.Fatalf("message leaks model context: %q", got.Message)
 	}
-	if !strings.Contains(got.Message, "/v0/management/auth-files") {
-		t.Fatalf("message missing management hint: %q", got.Message)
+	if strings.Contains(got.Message, "/v0/management/") {
+		t.Fatalf("message leaks management endpoint: %q", got.Message)
+	}
+	if got.Message == "" {
+		t.Fatalf("message should not be empty")
 	}
 }
 

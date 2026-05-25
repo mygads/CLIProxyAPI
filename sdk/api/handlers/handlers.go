@@ -102,7 +102,7 @@ func WithDisallowFreeAuth(ctx context.Context) context.Context {
 }
 
 // BuildErrorResponseBody builds an OpenAI-compatible JSON error response body.
-// If errText is already valid JSON, it is returned as-is to preserve upstream error payloads.
+// Internal provider details are sanitized before being included in the response.
 func BuildErrorResponseBody(status int, errText string) []byte {
 	if status <= 0 {
 		status = http.StatusInternalServerError
@@ -113,8 +113,13 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 
 	trimmed := strings.TrimSpace(errText)
 	if trimmed != "" && json.Valid([]byte(trimmed)) {
-		return []byte(trimmed)
+		// Parse the upstream JSON and sanitize any internal details.
+		sanitized := sanitizeUpstreamErrorJSON([]byte(trimmed), status)
+		return sanitized
 	}
+
+	// Sanitize plain-text error messages.
+	errText = sanitizeErrorText(errText, status)
 
 	errType := "invalid_request_error"
 	var code string
@@ -1522,25 +1527,9 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 		return err
 	}
 
-	providerText := strings.Join(providers, ",")
-	if providerText == "" {
-		providerText = "unknown"
-	}
-	modelText := strings.TrimSpace(model)
-	if modelText == "" {
-		modelText = "unknown"
-	}
-
-	baseMessage := strings.TrimSpace(authErr.Message)
-	if baseMessage == "" {
-		baseMessage = "no auth available"
-	}
-	detail := fmt.Sprintf("%s (providers=%s, model=%s)", baseMessage, providerText, modelText)
-
-	// Clarify the most common alias confusion between Anthropic route names and internal provider keys.
-	if strings.Contains(","+providerText+",", ",claude,") {
-		detail += "; check Claude auth/key session and cooldown state via /v0/management/auth-files"
-	}
+	// Return a safe customer-facing message without exposing internal
+	// provider names, model routing details, or management endpoints.
+	safeMessage := "No available credentials for the requested model. Please retry shortly."
 
 	status := authErr.HTTPStatus
 	if status <= 0 {
@@ -1549,7 +1538,7 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 
 	return &coreauth.Error{
 		Code:       authErr.Code,
-		Message:    detail,
+		Message:    safeMessage,
 		Retryable:  authErr.Retryable,
 		HTTPStatus: status,
 	}

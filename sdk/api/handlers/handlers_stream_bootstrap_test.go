@@ -524,11 +524,15 @@ func TestExecuteStreamWithAuthManager_EnrichesBootstrapRetryAuthUnavailableError
 	if authErr.Code != "auth_unavailable" {
 		t.Fatalf("code = %q, want %q", authErr.Code, "auth_unavailable")
 	}
-	if !strings.Contains(authErr.Message, "providers=codex") {
-		t.Fatalf("message missing provider context: %q", authErr.Message)
+	// Customer-facing error must NOT leak internal provider/model details.
+	if strings.Contains(authErr.Message, "providers=") {
+		t.Fatalf("message leaks provider context: %q", authErr.Message)
 	}
-	if !strings.Contains(authErr.Message, "model=test-model") {
-		t.Fatalf("message missing model context: %q", authErr.Message)
+	if strings.Contains(authErr.Message, "model=") {
+		t.Fatalf("message leaks model context: %q", authErr.Message)
+	}
+	if authErr.Message == "" {
+		t.Fatalf("message should not be empty")
 	}
 
 	if executor.Calls() != 1 {
