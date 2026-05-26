@@ -289,6 +289,14 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// receives the raw %-encoded value and must url.PathUnescape it itself.
 	engine.UseRawPath = true
 	engine.UnescapePathValues = false
+	// Security: disable Gin's default trusted-proxy list. Without this,
+	// Gin trusts X-Forwarded-For from any client, so an attacker can
+	// claim to be 127.0.0.1 and bypass the management handler's
+	// localClient check. Now c.ClientIP() reflects the actual TCP peer
+	// (or the configured proxy if engineConfigurator overrides this).
+	if errSetTrustedProxies := engine.SetTrustedProxies(nil); errSetTrustedProxies != nil {
+		log.Warnf("failed to disable trusted proxy headers: %v", errSetTrustedProxies)
+	}
 	if optionState.engineConfigurator != nil {
 		optionState.engineConfigurator(engine)
 	}
