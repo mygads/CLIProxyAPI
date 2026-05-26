@@ -129,6 +129,11 @@ type Config struct {
 	// Used for services that use Vertex AI-style paths but with simple API key authentication.
 	VertexCompatAPIKey []VertexCompatKey `yaml:"vertex-api-key" json:"vertex-api-key"`
 
+	// CommandCodeKey defines a list of Command Code (commandcode.ai) API key configurations.
+	// Phase 1: storage only — UI can save/list/delete keys via management API.
+	// Inference for the commandcode channel is not wired yet (see Phase 2 plan).
+	CommandCodeKey []CommandCodeKey `yaml:"commandcode-api-key,omitempty" json:"commandcode-api-key,omitempty"`
+
 	// AmpCode contains Amp CLI upstream configuration, management restrictions, and model mappings.
 	AmpCode AmpCode `yaml:"ampcode" json:"ampcode"`
 
@@ -500,6 +505,60 @@ type CodexModel struct {
 func (m CodexModel) GetName() string  { return m.Name }
 func (m CodexModel) GetAlias() string { return m.Alias }
 
+// CommandCodeKey represents the configuration for a Command Code (commandcode.ai)
+// API key. Command Code uses bearer-token auth (api keys start with "user_…").
+//
+// Phase 1: this struct is storage-only — the management API persists entries
+// here but no executor/translator is wired yet. The runtime will not route
+// requests to commandcode until Phase 2 lands.
+type CommandCodeKey struct {
+	// APIKey is the bearer token used to authenticate against api.commandcode.ai.
+	// Tokens typically start with "user_…".
+	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// Priority controls selection preference when multiple credentials match.
+	// Higher values are preferred; defaults to 0.
+	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
+
+	// Prefix optionally namespaces models for this credential (e.g., "teamA/cmc").
+	// Required for routing — entries without a prefix are dropped by Sanitize.
+	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
+
+	// BaseURL optionally overrides the Command Code API endpoint.
+	// Defaults to https://api.commandcode.ai/alpha when empty.
+	BaseURL string `yaml:"base-url,omitempty" json:"base-url,omitempty"`
+
+	// ProxyURL overrides the global proxy setting for this API key if provided.
+	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// Models defines upstream model names and aliases for request routing.
+	Models []CommandCodeModel `yaml:"models,omitempty" json:"models,omitempty"`
+
+	// Headers optionally adds extra HTTP headers for requests sent with this key.
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+
+	// ExcludedModels lists model IDs that should be excluded for this provider.
+	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
+
+	// DisableCooling disables auth/model cooldown scheduling for this credential when true.
+	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+}
+
+func (k CommandCodeKey) GetAPIKey() string  { return k.APIKey }
+func (k CommandCodeKey) GetBaseURL() string { return k.BaseURL }
+
+// CommandCodeModel describes a mapping between an alias and the actual upstream model name.
+type CommandCodeModel struct {
+	// Name is the upstream model identifier used when issuing requests.
+	Name string `yaml:"name" json:"name"`
+
+	// Alias is the client-facing model name that maps to Name.
+	Alias string `yaml:"alias" json:"alias"`
+}
+
+func (m CommandCodeModel) GetName() string  { return m.Name }
+func (m CommandCodeModel) GetAlias() string { return m.Alias }
+
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
 type GeminiKey struct {
@@ -736,6 +795,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize Codex keys: drop entries without base-url
 	cfg.SanitizeCodexKeys()
 
+	// Sanitize Command Code keys: drop entries without api-key or prefix
+	cfg.SanitizeCommandCodeKeys()
+
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()
 
@@ -945,6 +1007,34 @@ func (cfg *Config) SanitizeCodexKeys() {
 		out = append(out, e)
 	}
 	cfg.CodexKey = out
+}
+
+// SanitizeCommandCodeKeys removes Command Code API key entries missing a prefix
+// or API key. Prefix is mandatory per docs/PRD-V3-PREFIX-LOADBALANCE.md §3.1.
+// BaseURL is optional and falls back to the upstream default at runtime.
+func (cfg *Config) SanitizeCommandCodeKeys() {
+	if cfg == nil || len(cfg.CommandCodeKey) == 0 {
+		return
+	}
+	out := make([]CommandCodeKey, 0, len(cfg.CommandCodeKey))
+	for i := range cfg.CommandCodeKey {
+		e := cfg.CommandCodeKey[i]
+		e.APIKey = strings.TrimSpace(e.APIKey)
+		e.Prefix = normalizeModelPrefix(e.Prefix)
+		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		e.ProxyURL = strings.TrimSpace(e.ProxyURL)
+		e.Headers = NormalizeHeaders(e.Headers)
+		e.ExcludedModels = NormalizeExcludedModels(e.ExcludedModels)
+		if e.APIKey == "" {
+			continue
+		}
+		if e.Prefix == "" {
+			log.Warnf("commandcode key (base %q) has empty prefix; skipping — set a prefix via the panel or config.yaml", e.BaseURL)
+			continue
+		}
+		out = append(out, e)
+	}
+	cfg.CommandCodeKey = out
 }
 
 // SanitizeClaudeKeys normalizes headers for Claude credentials and drops
