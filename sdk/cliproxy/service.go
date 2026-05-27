@@ -434,6 +434,7 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
+	case "commandcode":
 		s.coreManager.RegisterExecutor(executor.NewCommandCodeExecutor(s.cfg))
 	case "github":
 		s.coreManager.RegisterExecutor(executor.NewGitHubCopilotExecutor(s.cfg))
