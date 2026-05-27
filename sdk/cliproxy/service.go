@@ -1164,6 +1164,17 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "kimi":
 		models = registry.GetKimiModels()
 		models = applyExcludedModels(models, excluded)
+	case "commandcode":
+		// Command Code (commandcode.ai) — bearer-token API; build models
+		// from user-supplied list in cfg.CommandCodeKey since there's no
+		// static catalog in registry (Phase 2).
+		if entry := s.resolveConfigCommandCodeKey(a); entry != nil {
+			models = buildCommandCodeConfigModels(entry)
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
+			}
+		}
+		models = applyExcludedModels(models, excluded)
 	case "kiro":
 		// Kiro models map to AmazonCodeWhispererService.ListAvailableModels.
 		// The static list (registry.GetKiroModels) covers the catalog snapshot
@@ -1456,6 +1467,32 @@ func (s *Service) resolveConfigCodexKey(auth *coreauth.Auth) *config.CodexKey {
 	return nil
 }
 
+func (s *Service) resolveConfigCommandCodeKey(auth *coreauth.Auth) *config.CommandCodeKey {
+	if auth == nil || s.cfg == nil {
+		return nil
+	}
+	var attrKey, attrBase string
+	if auth.Attributes != nil {
+		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
+		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
+	}
+	for i := range s.cfg.CommandCodeKey {
+		entry := &s.cfg.CommandCodeKey[i]
+		cfgKey := strings.TrimSpace(entry.APIKey)
+		cfgBase := strings.TrimSpace(entry.BaseURL)
+		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
+			if cfgBase == "" || strings.EqualFold(cfgBase, attrBase) {
+				return entry
+			}
+			continue
+		}
+		if attrKey == "" && attrBase != "" && strings.EqualFold(cfgBase, attrBase) {
+			return entry
+		}
+	}
+	return nil
+}
+
 func (s *Service) oauthExcludedModels(provider, authKind string) []string {
 	cfg := s.cfg
 	if cfg == nil {
@@ -1677,6 +1714,34 @@ func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
 		return nil
 	}
 	return registry.WithCodexBuiltins(buildConfigModels(entry.Models, "openai", "openai"))
+}
+
+func buildCommandCodeConfigModels(entry *config.CommandCodeKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	models := make([]*ModelInfo, 0, len(entry.Models))
+	for i := range entry.Models {
+		m := entry.Models[i]
+		modelID := strings.TrimSpace(m.Alias)
+		if modelID == "" {
+			modelID = strings.TrimSpace(m.Name)
+		}
+		if modelID == "" {
+			continue
+		}
+		models = append(models, &ModelInfo{
+			ID:          modelID,
+			Object:      "model",
+			Created:     time.Now().Unix(),
+			OwnedBy:     "commandcode",
+			Type:        "commandcode",
+			DisplayName: modelID,
+			UserDefined: false,
+			Thinking:    &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+		})
+	}
+	return models
 }
 
 func rewriteModelInfoName(name, oldID, newID string) string {
