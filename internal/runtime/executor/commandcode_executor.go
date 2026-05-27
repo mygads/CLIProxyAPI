@@ -123,7 +123,7 @@ func (e *CommandCodeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	}
 	openaiPayload := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), false)
 
-	commandCodeBody, err := buildCommandCodeBody(baseModel, openaiPayload, false)
+	commandCodeBody, err := buildCommandCodeBody(baseModel, openaiPayload, true)
 	if err != nil {
 		return resp, fmt.Errorf("commandcode executor: build payload: %w", err)
 	}
@@ -442,7 +442,7 @@ func buildCommandCodeBody(model string, openaiPayload []byte, stream bool) ([]by
 	params := ccParams{
 		Model:       model,
 		Messages:    messages,
-		Stream:      stream,
+		Stream:      true,
 		MaxTokens:   maxTokens,
 		Temperature: temperature,
 	}
