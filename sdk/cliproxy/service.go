@@ -434,6 +434,7 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
+		s.coreManager.RegisterExecutor(executor.NewCommandCodeExecutor(s.cfg))
 	case "github":
 		s.coreManager.RegisterExecutor(executor.NewGitHubCopilotExecutor(s.cfg))
 	case "kiro":
@@ -589,6 +590,7 @@ func (s *Service) registerHomeExecutors() {
 	s.coreManager.RegisterExecutor(executor.NewAIStudioExecutor(s.cfg, "", s.wsGateway))
 	s.coreManager.RegisterExecutor(executor.NewAntigravityExecutor(s.cfg))
 	s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
+	s.coreManager.RegisterExecutor(executor.NewCommandCodeExecutor(s.cfg))
 	s.coreManager.RegisterExecutor(executor.NewGitHubCopilotExecutor(s.cfg))
 	s.coreManager.RegisterExecutor(executor.NewKiroExecutor(s.cfg))
 	s.coreManager.RegisterExecutor(executor.NewQwenExecutor(s.cfg))
