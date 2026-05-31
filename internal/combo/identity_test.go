@@ -71,6 +71,10 @@ func TestIsIdentityQuestion_English(t *testing.T) {
 		"who created you and what model is this?",
 		"are you an AI? which one?",
 		"what version of model is this",
+		"who built this assistant",
+		"which company developed the assistant I am chatting with",
+		"what is the name of the AI system I am talking to",
+		"what should I call you",
 	}
 	for _, q := range positives {
 		body := makeOpenAIBody("user", q)
@@ -100,6 +104,8 @@ func TestIsIdentityQuestion_Indonesian(t *testing.T) {
 		"perkenalkan dirimu",
 		"siapa yang membuat kamu?",
 		"kamu ai ya?",
+		"siapa yang buat asisten ini?",
+		"nama ai ini apa?",
 	}
 	for _, q := range positives {
 		body := makeOpenAIBody("user", q)
@@ -161,6 +167,8 @@ func TestIsIdentityQuestion_Negatives(t *testing.T) {
 		"describe the architecture of this service",
 		"who created this repository",
 		"buatkan fungsi untuk validasi model input",
+		"who created this repository",
+		"what is the name of the npm package for date formatting",
 		"explain this code to me please and also tell me about the architecture of this system in detail with examples",
 	}
 	for _, q := range negatives {

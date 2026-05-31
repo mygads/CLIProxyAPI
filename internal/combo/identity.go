@@ -26,6 +26,11 @@ var IdentityQuestionRegex = regexp.MustCompile(`(?i)(?:` +
 	`\b(?:introduce|describe)\s+yourself\b|` +
 	`\btell\s+me\s+about\s+yourself\b|` +
 	`\bwho\s+(?:created|made|built|developed|trained|designed)\s+(?:you|u)\b|` +
+	`\bwho\s+(?:built|made|created|developed|designed|trained)\s+(?:this|the)\s+(?:ai|assistant|model|bot|llm|chat\s?bot)\b|` +
+	`\bwhich\s+(?:company|org|organi[sz]ation)\s+(?:developed|made|built|created|owns|trained)\s+(?:you|(?:this|the)\s+(?:ai|assistant|model|bot|llm))\b|` +
+	`\bname\s+of\s+(?:the|this)\s+(?:ai|assistant|llm|chat\s?bot)\b|` +
+	`\bwhat\s+should\s+i\s+call\s+you\b|` +
+	`\b(?:background|origin)\s+as\s+(?:an?\s+)?(?:ai|assistant|model|llm)\b|` +
 	`\bare\s+(?:you|u)\s+(?:an?\s+)?(?:ai|llm|bot|chat\s?bot|language\s+model|assistant)\b|` +
 	`\bwhat\s+(?:version|kind|type)\s+(?:of\s+)?(?:model|ai|llm|assistant)\b|` +
 	`\bwhat(?:'?s| is| are)?\s+your\s+(?:name|model|identity|version)\b|` +
@@ -46,6 +51,10 @@ var IdentityQuestionRegex = regexp.MustCompile(`(?i)(?:` +
 	`\bmodel\s+(?:apa|asli|sebenarnya|dibalik|di\s+balik|berapa)\b|` +
 	`\b(?:pakai|pake|gunakan|menggunakan|jalan|berjalan|dibangun|dibuat|dilatih|berbasis|basis)\s+(?:di\s+atas\s+)?model\b|` +
 	`\bsiapa\s+(?:yang\s+)?(?:buat|membuat|bikin|melatih|menciptakan)\s+(?:kamu|anda|km)\b|` +
+	`\bsiapa\s+(?:yang\s+)?(?:buat|membuat|bikin)\s+(?:ai|asisten|asistant|model|bot)\s+ini\b|` +
+	`\b(?:perusahaan|company)\s+(?:apa\s+)?(?:yang\s+)?(?:buat|membuat|bikin)\b|` +
+	`\bnama\s+(?:ai|asisten|model|bot)\s+ini\b|` +
+	`\b(?:panggil|sebut)\s+(?:kamu|anda|km)\s+(?:apa|gimana)\b|` +
 	`\b(?:kamu|anda|km|kau|lu)\b[^.?!]{0,25}?\bmodel\s+apa\b|` +
 	`\bapa(?:kah)?\s+(?:nama|model|jenis)\s*(?:mu|kamu|anda)\b|` +
 	`\b(?:nama|model)\s+(?:mu|kamu|anda)\b|` +
