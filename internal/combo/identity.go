@@ -42,24 +42,22 @@ func ParseDisplayName(displayName string) (modelName, vendor string) {
 	return
 }
 
-// IsIdentityQuestion checks whether an OpenAI-format request body
-// contains a single-turn identity question. Returns true only when:
-//   - There is exactly one user turn
+// IsIdentityQuestion checks whether an OpenAI-format request body's LAST
+// message is a single-turn-style identity question. Returns true when:
 //   - The last message is from the user
 //   - The message text is short (<280 chars) and matches the identity regex
+//
+// We intentionally do NOT require the whole conversation to be a single
+// user turn. Agentic clients (Claude Code, Kiro, Cline, etc.) always send
+// a system prompt + tool definitions + prior turns, so a single-turn gate
+// never fired for them — and the upstream provider's identity ("I'm
+// Kiro…", "I'm Kimi…") leaked through to the customer. The tight regex
+// plus the 280-char cap keep this from hijacking real coding tasks that
+// merely mention the word "model"; a genuine "model apa kamu?" is short
+// and matches regardless of how deep the conversation is.
 func IsIdentityQuestion(openaiBody []byte) bool {
 	messages := gjson.GetBytes(openaiBody, "messages").Array()
 	if len(messages) == 0 {
-		return false
-	}
-
-	userTurns := 0
-	for _, m := range messages {
-		if m.Get("role").String() == "user" {
-			userTurns++
-		}
-	}
-	if userTurns != 1 {
 		return false
 	}
 

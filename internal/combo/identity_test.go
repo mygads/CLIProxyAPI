@@ -99,13 +99,31 @@ func TestIsIdentityQuestion_Negatives(t *testing.T) {
 }
 
 func TestIsIdentityQuestion_MultiTurn(t *testing.T) {
+	// Multi-turn conversations where the LAST user message is a short
+	// identity question SHOULD trigger the rewrite — agentic clients
+	// (Claude Code, Kiro, Cline) are always multi-turn, and the upstream
+	// provider's identity would otherwise leak. The tight regex + length
+	// cap keep this from hijacking real coding tasks.
 	body := makeMultiTurnBody([]map[string]any{
 		{"role": "user", "content": "hello"},
 		{"role": "assistant", "content": "hi there"},
 		{"role": "user", "content": "who are you"},
 	})
+	if !IsIdentityQuestion(body) {
+		t.Error("multi-turn ending in an identity question SHOULD trigger")
+	}
+}
+
+func TestIsIdentityQuestion_MultiTurnNonIdentityLast(t *testing.T) {
+	// Multi-turn whose last user message is a real task must NOT trigger,
+	// even if an earlier turn looked like an identity question.
+	body := makeMultiTurnBody([]map[string]any{
+		{"role": "user", "content": "who are you"},
+		{"role": "assistant", "content": "I'm an assistant"},
+		{"role": "user", "content": "now help me write a sorting function in Go"},
+	})
 	if IsIdentityQuestion(body) {
-		t.Error("multi-turn should NOT trigger identity question")
+		t.Error("multi-turn ending in a real task should NOT trigger")
 	}
 }
 

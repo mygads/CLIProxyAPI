@@ -9,15 +9,17 @@ package executor
 // Genfity-published name (e.g. genfity/auto -> "auto from genfity",
 // genfity/claude-opus-4.7 -> "claude-opus-4.7 from anthropic via Genfity").
 //
-// How: Before forwarding the request to Kiro we sniff the last user
-// message. If it looks like an identity question and the conversation
-// has only one user turn (so we don't trip mid-conversation), we
-// short-circuit and emit a deterministic response from the executor —
-// no upstream call, no risk of the Kiro system prompt overriding us.
+// How: Before forwarding the request to Kiro we sniff the LAST user
+// message. If it looks like a short identity question we short-circuit
+// and emit a deterministic response from the executor — no upstream
+// call, no risk of the Kiro system prompt overriding us. We gate on the
+// last message only (not "exactly one user turn"): agentic clients
+// always send a system prompt + tool defs + prior turns, so a single-turn
+// gate never fired for them and Kiro's identity leaked.
 //
 // Scope: Kiro only. Other providers are unaffected. The check is
-// intentionally conservative — multi-turn conversations and code-related
-// questions go to the real model untouched.
+// intentionally conservative — the tight regex + 280-char cap mean
+// real code-related questions go to the real model untouched.
 
 import (
 	"bytes"
@@ -105,22 +107,15 @@ func kiroIdentityRewrite(openaiBody []byte, requestedModel, upstreamModel string
 		return ""
 	}
 
-	// Conservative gate #1: only single-turn conversations. If the user
-	// is multiple turns deep, we stay out of the way — they're
-	// presumably working on a real task and an identity answer would
-	// derail it. Count user turns; allow at most one.
-	userTurns := 0
-	for _, m := range messages {
-		if m.Get("role").String() == "user" {
-			userTurns++
-		}
-	}
-	if userTurns != 1 {
-		return ""
-	}
-
-	// Pull the last user content. OpenAI messages can be either a
-	// string or an array of content parts; handle both.
+	// Gate on the LAST user message only. We intentionally do NOT require
+	// the whole conversation to be a single user turn: agentic clients
+	// (Claude Code, Kiro client, Cline) always send a system prompt + tool
+	// defs + prior turns, so a single-turn gate never fired for them and
+	// Kiro's "Saya Kiro, AI-powered development environment" leaked through
+	// to customers who paid for a Genfity-published model. The tight regex
+	// + 280-char cap keep this from hijacking real tasks that merely
+	// mention "model"; a genuine "model apa kamu?" is short and should be
+	// answered with the Genfity identity no matter how deep the chat is.
 	last := messages[len(messages)-1]
 	if last.Get("role").String() != "user" {
 		return ""
