@@ -11,24 +11,34 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// IdentityQuestionRegex matches common shapes of "who/what are you" in
-// English and Indonesian. Tight so casual mentions of "model" inside
-// code-help requests don't match.
-var IdentityQuestionRegex = regexp.MustCompile(`(?i)\b(?:` +
-	// English
-	`who\s+are\s+you|` +
-	`what(?:'s| is)\s+your\s+(?:name|model|model\s+id|identity)|` +
-	`which\s+(?:model|ai|llm)\s+are\s+you|` +
-	`are\s+you\s+(?:gpt|claude|gemini|kiro|llama|chatgpt)|` +
-	`tell\s+me\s+(?:your\s+name|who\s+you\s+are|which\s+model)|` +
-	// Indonesian
-	`siapa(?:kah)?\s+(?:kamu|anda|kau|lu|km)|` +
-	`(?:kamu|anda|km)\s+(?:siapa|model\s+apa)|` +
-	`model(?:\s+apa)?\s+(?:kamu|anda|nya|km)|` +
-	`(?:kamu|anda|km)\s+(?:itu|adalah)?\s*model\s+apa|` +
-	`apa(?:kah)?\s+(?:nama|model|jenis)\s*(?:mu|kamu|anda)|` +
-	`(?:nama|model)\s+(?:mu|kamu|anda)\s+(?:apa|siapa)` +
-	`)\b`)
+// IdentityQuestionRegex matches common shapes of "who/what are you" /
+// "which model powers you" in English and Indonesian. Broad enough to
+// catch natural phrasings (a tight single-phrase regex let "what model
+// are you?", "kamu kiro ya?", "kamu jalan di atas model apa?" leak the
+// upstream identity), but still anchored on an identity referent so
+// casual mentions of "model" in code-help requests ("fix my data model",
+// "buatkan model apa yang cocok") don't match. Paired with the 280-char
+// cap in IsIdentityQuestion, false positives stay rare.
+var IdentityQuestionRegex = regexp.MustCompile(`(?i)(?:` +
+	// ── English ──
+	`\bwho\s+(?:are|r)\s+(?:you|u)\b|` +
+	`\bwhat(?:'?s| is| are)?\s+your\s+(?:name|model|identity)\b|` +
+	`\bwhat\s+(?:ai\s+|llm\s+)?model\s+(?:are|r)\s+(?:you|u)\b|` +
+	`\bwhich\s+(?:underlying\s+|base\s+|actual\s+|real\s+)?(?:model|ai|llm)\b|` +
+	`\b(?:underlying|base|actual|real)\s+(?:model|llm)\b|` +
+	`\bmodel\s+(?:powers|power|runs|run|drives|drive|behind|backing)\s+(?:you|u)\b|` +
+	`\b(?:you|u)(?:'re| are|r)?\s+(?:powered|running|built|based|driven|backed)\s+(?:on|by)\b|` +
+	`\bare\s+you\s+(?:really\s+|actually\s+)?(?:based\s+on\s+|built\s+on\s+|running\s+on\s+|powered\s+by\s+)?(?:gpt|claude|gemini|kiro|llama|chatgpt|kimi|qwen|deepseek|glm|minimax|mimo|anthropic|openai|moonshot)\b|` +
+	`\btell\s+me\s+(?:your\s+name|who\s+you\s+are|which\s+model|what\s+model|the\s+(?:underlying\s+)?model)\b|` +
+	// ── Indonesian ──
+	`\bsiapa(?:kah)?\s+(?:kamu|anda|kau|lu|km)\b|` +
+	`\b(?:kamu|anda|km|kau|lu)\s+(?:siapa|kiro|gpt|claude|chatgpt|gemini|kimi|qwen|deepseek)\b|` +
+	`\bmodel\s+(?:apa|asli|sebenarnya|dibalik|di\s+balik)\b|` +
+	`\b(?:pakai|pake|gunakan|menggunakan|jalan|berjalan|dibangun|berbasis|basis)\s+(?:di\s+atas\s+)?model\b|` +
+	`\b(?:kamu|anda|km|kau|lu)\b[^.?!]{0,25}?\bmodel\s+apa\b|` +
+	`\bapa(?:kah)?\s+(?:nama|model|jenis)\s*(?:mu|kamu|anda)\b|` +
+	`\b(?:nama|model)\s+(?:mu|kamu|anda)\b` +
+	`)`)
 
 // ParseDisplayName splits a pipe-separated display name into model name
 // and vendor. Format: "ModelName|Vendor". If no pipe, the entire string

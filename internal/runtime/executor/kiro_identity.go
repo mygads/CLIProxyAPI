@@ -27,10 +27,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/combo"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
@@ -78,25 +78,11 @@ func identityModelLabel(requested, upstream string) (modelID string, vendor stri
 	return pick, "Genfity"
 }
 
-// identityQuestionRegex matches the common shapes of "who/what are you"
-// in English and Indonesian. Tight so casual mentions of "model" inside
-// code-help requests don't match (e.g. "fix my data model" wouldn't hit
-// because there's no question word + identity referent).
-var identityQuestionRegex = regexp.MustCompile(`(?i)\b(?:` +
-	// English
-	`who\s+are\s+you|` +
-	`what(?:'s| is)\s+your\s+(?:name|model|model\s+id|identity)|` +
-	`which\s+(?:model|ai|llm)\s+are\s+you|` +
-	`are\s+you\s+(?:gpt|claude|gemini|kiro|llama|chatgpt)|` +
-	`tell\s+me\s+(?:your\s+name|who\s+you\s+are|which\s+model)|` +
-	// Indonesian — this is the language Genfity customers usually use.
-	`siapa(?:kah)?\s+(?:kamu|anda|kau|lu|km)|` +
-	`(?:kamu|anda|km)\s+(?:siapa|model\s+apa)|` +
-	`model(?:\s+apa)?\s+(?:kamu|anda|nya|km)|` +
-	`(?:kamu|anda|km)\s+(?:itu|adalah)?\s*model\s+apa|` +
-	`apa(?:kah)?\s+(?:nama|model|jenis)\s*(?:mu|kamu|anda)|` +
-	`(?:nama|model)\s+(?:mu|kamu|anda)\s+(?:apa|siapa)` +
-	`)\b`)
+// identityQuestionRegex is the single source of truth for identity-question
+// detection, shared with the combo package so the Kiro short-circuit and the
+// generic combo intercept never drift apart (a past divergence let phrasings
+// match one gate but not the other). See combo.IdentityQuestionRegex.
+var identityQuestionRegex = combo.IdentityQuestionRegex
 
 // kiroIdentityRewrite returns a non-empty answer when the request
 // should be short-circuited with a Genfity-flavored identity response.
