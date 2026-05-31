@@ -109,6 +109,46 @@ func TestIsIdentityQuestion_Indonesian(t *testing.T) {
 	}
 }
 
+func TestIsIdentityQuestion_OtherLanguages(t *testing.T) {
+	positives := []string{
+		// French
+		"tu es quel modèle exactement?",
+		"qui es-tu?",
+		"présente-toi",
+		// Spanish
+		"qué modelo eres?",
+		"quién eres?",
+		"preséntate",
+		// Portuguese
+		"qual modelo você é?",
+		"quem é você?",
+		// Italian
+		"che modello sei?",
+		"chi sei?",
+		// German
+		"welches modell bist du?",
+		"wer bist du?",
+		// Chinese
+		"你是什么模型",
+		"你是谁",
+		// Japanese
+		"あなたは誰ですか",
+		"どのモデルですか",
+		// Korean
+		"너 누구야",
+		"어떤 모델이야",
+		// Arabic
+		"من أنت",
+		"ما هو النموذج",
+	}
+	for _, q := range positives {
+		body := makeOpenAIBody("user", q)
+		if !IsIdentityQuestion(body) {
+			t.Errorf("expected identity question for %q", q)
+		}
+	}
+}
+
 func TestIsIdentityQuestion_Negatives(t *testing.T) {
 	negatives := []string{
 		"fix my data model",

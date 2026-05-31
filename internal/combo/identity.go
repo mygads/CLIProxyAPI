@@ -48,7 +48,28 @@ var IdentityQuestionRegex = regexp.MustCompile(`(?i)(?:` +
 	`\bsiapa\s+(?:yang\s+)?(?:buat|membuat|bikin|melatih|menciptakan)\s+(?:kamu|anda|km)\b|` +
 	`\b(?:kamu|anda|km|kau|lu)\b[^.?!]{0,25}?\bmodel\s+apa\b|` +
 	`\bapa(?:kah)?\s+(?:nama|model|jenis)\s*(?:mu|kamu|anda)\b|` +
-	`\b(?:nama|model)\s+(?:mu|kamu|anda)\b` +
+	`\b(?:nama|model)\s+(?:mu|kamu|anda)\b|` +
+	// ── Other languages (FR/ES/PT/IT/DE) — "which/what model are you",
+	// "who are you", "introduce yourself". Anchored on an identity
+	// referent so generic uses of "modèle/modelo/modell" don't trip.
+	`\b(?:tu\s+es|vous\s+êtes|t'es)\s+(?:quel|qui)\b|` + // FR: tu es quel/qui
+	`\bquel\s+(?:modèle|mod[eè]le|ia)\b|` + // FR: quel modèle
+	`\bqui\s+(?:es-tu|êtes-vous|es\s+tu)\b|` + // FR: qui es-tu
+	`\bpr[ée]sente-toi\b|` + // FR: présente-toi
+	`\b(?:qu[eé]\s+modelo|cu[aá]l\s+modelo|qu[eé]\s+ia)\b|` + // ES: qué/cuál modelo
+	`\b(?:qui[eé]n\s+eres|qui[eé]n\s+sos)\b|` + // ES: quién eres
+	`\bpres[eé]ntate\b|` + // ES: preséntate
+	`\b(?:qual\s+modelo|que\s+modelo)\b|` + // PT: qual/que modelo
+	`\bquem\s+(?:é\s+você|e\s+voce|es\s+voce)|` + // PT: quem é você
+	`\b(?:quale\s+modello|che\s+modello)\b|` + // IT: quale/che modello
+	`\bchi\s+sei\b|` + // IT: chi sei
+	`\bwelches\s+(?:modell|ki)\b|` + // DE: welches modell
+	`\bwer\s+bist\s+du\b|` + // DE: wer bist du
+	// ── CJK / Arabic — "what model / who are you" (no \b around CJK) ──
+	`什么模型|哪个模型|你是(?:什么|谁|哪)|你是不是|介绍.{0,3}自己|` + // ZH
+	`どのモデル|何のモデル|モデルは(?:何|なに)|あなたは(?:誰|だれ)|自己紹介|` + // JA
+	`어떤\s*모델|무슨\s*모델|너\s*누구|당신은\s*누구|` + // KO
+	`ما\s+(?:هو\s+)?(?:النموذج|الموديل)|من\s+أنت` + // AR
 	`)`)
 
 // ParseDisplayName splits a pipe-separated display name into model name
