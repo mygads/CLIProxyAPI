@@ -93,6 +93,122 @@ func TestResolveModelAttempts_nilResolverIsSingleAttempt(t *testing.T) {
 	}
 }
 
+// A combo whose fallback entry is ITSELF a combo must be flattened to the
+// nested combo's leaf models. This is the production bug that broke
+// genfity/claude-opus-4.8 (and every *-thinking combo): the dead wahyu/
+// wahyu2 head entries fell through to a nested combo, but the loop handed
+// that combo NAME to executeSingle which only resolved its head (also a
+// dead prefix) and surfaced "unknown provider" as the final attempt.
+func TestResolveModelAttempts_nestedComboFlattened(t *testing.T) {
+	h := &BaseAPIHandler{Combos: &fakeComboResolver{chains: map[string][]ComboCandidate{
+		"genfity/claude-opus-4.8": {
+			{Model: "wahyu2/kr/claude-opus-4.8", TriggerOn: []string{"rate_limit"}},
+			{Model: "wahyu/kr/claude-opus-4.8"},
+			{Model: "genfity/claude-opus-4.7", IsLast: true},
+		},
+		"genfity/claude-opus-4.7": {
+			{Model: "wahyu2/kr/claude-opus-4.7"},
+			{Model: "kr/claude-opus-4.7", IsLast: true},
+		},
+	}}}
+	got := h.resolveModelAttempts("genfity/claude-opus-4.8")
+	want := []string{
+		"wahyu2/kr/claude-opus-4.8",
+		"wahyu/kr/claude-opus-4.8",
+		"wahyu2/kr/claude-opus-4.7",
+		"kr/claude-opus-4.7",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d flattened attempts, got %d: %#v", len(want), len(got), got)
+	}
+	for i := range want {
+		if got[i].Model != want[i] {
+			t.Errorf("attempt %d: want %q got %q", i, want[i], got[i].Model)
+		}
+		if i < len(want)-1 && got[i].IsLast {
+			t.Errorf("attempt %d (%q) must not be last", i, got[i].Model)
+		}
+	}
+	if !got[len(got)-1].IsLast {
+		t.Errorf("final flattened leaf %q must be IsLast", got[len(got)-1].Model)
+	}
+	// TriggerOn must survive flattening on the head entry.
+	if len(got[0].TriggerOn) != 1 || got[0].TriggerOn[0] != "rate_limit" {
+		t.Errorf("trigger_on lost on head: %#v", got[0].TriggerOn)
+	}
+}
+
+// A diamond graph (parent fans out to two combos that both fall back to the
+// same leaf) must not retry that shared leaf twice — first-seen order wins.
+func TestResolveModelAttempts_dedupSharedLeaf(t *testing.T) {
+	h := &BaseAPIHandler{Combos: &fakeComboResolver{chains: map[string][]ComboCandidate{
+		"parent": {
+			{Model: "child-a"},
+			{Model: "child-b", IsLast: true},
+		},
+		"child-a": {
+			{Model: "kr/x"},
+			{Model: "genfity/glm-5", IsLast: true},
+		},
+		"child-b": {
+			{Model: "kr/y"},
+			{Model: "genfity/glm-5", IsLast: true},
+		},
+		"genfity/glm-5": {
+			{Model: "masanto/glm-5", IsLast: true},
+		},
+	}}}
+	got := h.resolveModelAttempts("parent")
+	want := []string{"kr/x", "masanto/glm-5", "kr/y"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d deduped attempts, got %d: %#v", len(want), len(got), modelsOf(got))
+	}
+	for i := range want {
+		if got[i].Model != want[i] {
+			t.Errorf("attempt %d: want %q got %q (%#v)", i, want[i], got[i].Model, modelsOf(got))
+		}
+	}
+	if !got[len(got)-1].IsLast {
+		t.Error("final deduped leaf must be IsLast")
+	}
+}
+
+// A cyclic combo reference (A→B→A) must terminate and still surface the
+// real leaves rather than looping forever or dropping everything.
+func TestResolveModelAttempts_cycleGuard(t *testing.T) {
+	h := &BaseAPIHandler{Combos: &fakeComboResolver{chains: map[string][]ComboCandidate{
+		"combo-a": {
+			{Model: "kr/real-a"},
+			{Model: "combo-b", IsLast: true},
+		},
+		"combo-b": {
+			{Model: "kr/real-b"},
+			{Model: "combo-a", IsLast: true}, // cycle back to A
+		},
+	}}}
+	got := h.resolveModelAttempts("combo-a")
+	want := []string{"kr/real-a", "kr/real-b"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d attempts under cycle guard, got %d: %#v", len(want), len(got), modelsOf(got))
+	}
+	for i := range want {
+		if got[i].Model != want[i] {
+			t.Errorf("attempt %d: want %q got %q", i, want[i], got[i].Model)
+		}
+	}
+	if !got[len(got)-1].IsLast {
+		t.Error("final attempt under cycle guard must be IsLast")
+	}
+}
+
+func modelsOf(attempts []modelAttempt) []string {
+	out := make([]string, len(attempts))
+	for i, a := range attempts {
+		out[i] = a.Model
+	}
+	return out
+}
+
 func TestComboShouldFallback_retriableStatusOnly(t *testing.T) {
 	// PRD-blacklist: combo fallback fires for everything that is *not*
 	// a clear user-shape error. The legacy whitelist that only fired on

@@ -1155,25 +1155,84 @@ func (h *BaseAPIHandler) resolveModelAttempts(modelName string) []modelAttempt {
 	if h == nil || h.Combos == nil {
 		return []modelAttempt{{Model: modelName, IsLast: true}}
 	}
-	base := strings.TrimSpace(modelName)
 
-	// Check combo registry first — combo names may contain "/" so we
-	// cannot use the slash as a shortcut to skip the registry lookup.
-	candidates, ok := h.Combos.Candidates(base)
-	if ok && len(candidates) > 0 {
-		out := make([]modelAttempt, len(candidates))
-		for i, c := range candidates {
-			out[i] = modelAttempt{
-				Model:     c.Model,
-				TriggerOn: c.TriggerOn,
-				IsLast:    c.IsLast,
-			}
-		}
-		return out
+	// Recursively flatten the combo into real leaf models. A combo entry
+	// may itself be another combo (e.g. genfity/claude-opus-4.8 falls back
+	// to genfity/claude-opus-4.7, which has its own chain). Without this
+	// inlining the loop would hand the nested combo name to executeSingle,
+	// which only resolves the nested head and reports "unknown provider"
+	// when that head is a dead prefix — defeating the whole fallback.
+	flat := h.flattenComboAttempts(strings.TrimSpace(modelName), make(map[string]struct{}))
+	if len(flat) == 0 {
+		// Not a combo — treat as a plain prefixed model (e.g. "kr/auto").
+		return []modelAttempt{{Model: modelName, IsLast: true}}
 	}
 
-	// Not a combo — treat as a plain prefixed model (e.g. "kr/auto").
-	return []modelAttempt{{Model: modelName, IsLast: true}}
+	// Dedup leaves by model so a diamond combo graph (A→B, A→C, both →D)
+	// does not retry the same dead upstream twice, preserving first-seen
+	// order. Only the final surviving leaf carries IsLast.
+	out := make([]modelAttempt, 0, len(flat))
+	seenModel := make(map[string]struct{}, len(flat))
+	for _, a := range flat {
+		key := strings.ToLower(strings.TrimSpace(a.Model))
+		if key == "" {
+			continue
+		}
+		if _, dup := seenModel[key]; dup {
+			continue
+		}
+		seenModel[key] = struct{}{}
+		a.IsLast = false
+		out = append(out, a)
+	}
+	if len(out) == 0 {
+		return []modelAttempt{{Model: modelName, IsLast: true}}
+	}
+	out[len(out)-1].IsLast = true
+	return out
+}
+
+// flattenComboAttempts expands a combo name into the ordered list of leaf
+// attempts, recursively inlining any candidate that is itself a combo. The
+// `seen` set guards the current recursion path against cyclic combo
+// references (A→B→A) — entries are removed on the way back out so sibling
+// branches can still reuse a combo. IsLast is left unset on every returned
+// element; resolveModelAttempts stamps the final one. Returns nil when
+// modelName is not a combo (or resolves to no candidates).
+func (h *BaseAPIHandler) flattenComboAttempts(modelName string, seen map[string]struct{}) []modelAttempt {
+	key := strings.ToLower(strings.TrimSpace(modelName))
+	if key == "" {
+		return nil
+	}
+	if _, cycle := seen[key]; cycle {
+		return nil
+	}
+	candidates, ok := h.Combos.Candidates(modelName)
+	if !ok || len(candidates) == 0 {
+		return nil
+	}
+	seen[key] = struct{}{}
+	defer delete(seen, key)
+
+	out := make([]modelAttempt, 0, len(candidates))
+	for _, c := range candidates {
+		if child := h.flattenComboAttempts(c.Model, seen); len(child) > 0 {
+			// c.Model is itself a combo — inline its leaves in place.
+			out = append(out, child...)
+			continue
+		}
+		// child is empty: either c.Model is a real leaf model, or it is a
+		// known combo we could not expand (cycle / disabled / empty). Drop
+		// the unexpandable combo reference — emitting the combo NAME as a
+		// literal model would just produce a dead "unknown provider"
+		// attempt. Keep genuine leaves so the existing skip + fallback
+		// still applies to dead prefixes.
+		if h.Combos.Has(c.Model) {
+			continue
+		}
+		out = append(out, modelAttempt{Model: c.Model, TriggerOn: c.TriggerOn})
+	}
+	return out
 }
 
 // tryComboIdentityIntercept checks whether the request is an identity
