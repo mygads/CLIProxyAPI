@@ -113,21 +113,58 @@ func GetGitHubCopilotModels() []*ModelInfo {
 // as currentMessage.userInputMessage.modelId — do not canonicalize dots
 // to dashes or the upstream returns ValidationException.
 func GetKiroModels() []*ModelInfo {
-	return []*ModelInfo{
-		{ID: "auto", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Auto (Server Picks)"},
-		{ID: "claude-opus-4.7", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Claude Opus 4.7"},
-		{ID: "claude-opus-4.6", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Claude Opus 4.6"},
-		{ID: "claude-sonnet-4.6", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Claude Sonnet 4.6"},
-		{ID: "claude-opus-4.5", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Claude Opus 4.5"},
-		{ID: "claude-sonnet-4.5", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Claude Sonnet 4.5"},
-		{ID: "claude-sonnet-4", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Claude Sonnet 4"},
-		{ID: "claude-haiku-4.5", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Claude Haiku 4.5"},
-		{ID: "deepseek-3.2", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "DeepSeek v3.2"},
-		{ID: "minimax-m2.5", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "MiniMax M2.5"},
-		{ID: "minimax-m2.1", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "MiniMax M2.1"},
-		{ID: "glm-5", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "GLM 5"},
-		{ID: "qwen3-coder-next", Object: "model", Created: 1714521600, OwnedBy: "kiro", Type: "openai", DisplayName: "Qwen3 Coder Next"},
+	// Base models sourced from Kiro's ListAvailableModels (2026-06-01).
+	// Each base model gets -thinking, -agentic, -thinking-agentic variants
+	// (same as 9router's buildVariants). "auto" only gets -thinking (no agentic).
+	// The suffix is a router fiction — stripped before sending to CodeWhisperer;
+	// the executor injects thinking/agentic system-prompt prefixes instead.
+	type base struct {
+		id          string
+		display     string
+		noAgentic   bool // auto: no -agentic variant
 	}
+	bases := []base{
+		{"auto", "Auto (Server Picks)", true},
+		{"claude-opus-4.8", "Claude Opus 4.8", false},
+		{"claude-opus-4.7", "Claude Opus 4.7", false},
+		{"claude-opus-4.6", "Claude Opus 4.6", false},
+		{"claude-sonnet-4.6", "Claude Sonnet 4.6", false},
+		{"claude-sonnet-4.5", "Claude Sonnet 4.5", false},
+		{"claude-sonnet-4", "Claude Sonnet 4", false},
+		{"claude-haiku-4.5", "Claude Haiku 4.5", false},
+		{"deepseek-3.2", "DeepSeek v3.2", false},
+		{"minimax-m2.5", "MiniMax M2.5", false},
+		{"minimax-m2.1", "MiniMax M2.1", false},
+		{"glm-5", "GLM 5", false},
+		{"qwen3-coder-next", "Qwen3 Coder Next", false},
+	}
+
+	models := make([]*ModelInfo, 0, len(bases)*4)
+	for _, b := range bases {
+		// Base model
+		models = append(models, &ModelInfo{
+			ID: b.id, Object: "model", Created: 1714521600,
+			OwnedBy: "kiro", Type: "openai", DisplayName: b.display,
+		})
+		// -thinking variant
+		models = append(models, &ModelInfo{
+			ID: b.id + "-thinking", Object: "model", Created: 1714521600,
+			OwnedBy: "kiro", Type: "openai", DisplayName: b.display + " (Thinking)",
+		})
+		if !b.noAgentic {
+			// -agentic variant
+			models = append(models, &ModelInfo{
+				ID: b.id + "-agentic", Object: "model", Created: 1714521600,
+				OwnedBy: "kiro", Type: "openai", DisplayName: b.display + " (Agentic)",
+			})
+			// -thinking-agentic variant
+			models = append(models, &ModelInfo{
+				ID: b.id + "-thinking-agentic", Object: "model", Created: 1714521600,
+				OwnedBy: "kiro", Type: "openai", DisplayName: b.display + " (Thinking + Agentic)",
+			})
+		}
+	}
+	return models
 }
 
 // GetQwenModels returns the Qwen Code model catalog. Model IDs mirror

@@ -106,26 +106,99 @@ func (e *KiroExecutor) ensureAccessToken(ctx context.Context, auth *cliproxyauth
 	return res.AccessToken, nil
 }
 
+// kiroThinkingPrefix is the system-prompt prefix that enables Kiro's
+// reasoning mode. Injected when the model name carries a -thinking suffix.
+// Same shape as 9router's buildThinkingSystemPrefix (kiroConstants.js:219).
+const kiroThinkingPrefix = "<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>16000</max_thinking_length>"
+
+// kiroAgenticPrompt is the chunked-write protocol prompt injected when the
+// model name carries an -agentic suffix. Prevents Kiro's 2-3 minute server
+// timeout on large file operations. Ported from 9router kiroConstants.js:23-72.
+const kiroAgenticPrompt = `# CRITICAL: CHUNKED WRITE PROTOCOL (MANDATORY)
+
+You MUST follow these rules for ALL file operations. Violation causes server timeouts and task failure.
+
+## ABSOLUTE LIMITS
+- **MAXIMUM 350 LINES** per single write/edit operation - NO EXCEPTIONS
+- **RECOMMENDED 300 LINES** or less for optimal performance
+- **NEVER** write entire files in one operation if >300 lines
+
+## MANDATORY CHUNKED WRITE STRATEGY
+
+### For NEW FILES (>300 lines total):
+1. FIRST: Write initial chunk (first 250-300 lines) using write_to_file/fsWrite
+2. THEN: Append remaining content in 250-300 line chunks using file append operations
+3. REPEAT: Continue appending until complete
+
+### For EDITING EXISTING FILES:
+1. Use surgical edits (apply_diff/targeted edits) - change ONLY what's needed
+2. NEVER rewrite entire files - use incremental modifications
+3. Split large refactors into multiple small, focused edits
+
+### For LARGE CODE GENERATION:
+1. Generate in logical sections (imports, types, functions separately)
+2. Write each section as a separate operation
+3. Use append operations for subsequent sections
+
+## WHY THIS MATTERS
+- Server has 2-3 minute timeout for operations
+- Large writes exceed timeout and FAIL completely
+- Chunked writes are FASTER and more RELIABLE
+- Failed writes waste time and require retry
+
+REMEMBER: When in doubt, write LESS per operation. Multiple small operations > one large operation.`
+
+// resolveKiroModelSuffix strips -thinking and -agentic suffixes from a Kiro
+// model name and returns the upstream base model + flags. Order: strip
+// -agentic first (so -thinking-agentic → strip -agentic → strip -thinking).
+// This mirrors 9router's resolveKiroModel (kiroConstants.js:198-211).
+func resolveKiroModelSuffix(model string) (upstream string, thinking, agentic bool) {
+	upstream = model
+	if strings.HasSuffix(upstream, "-agentic") {
+		agentic = true
+		upstream = strings.TrimSuffix(upstream, "-agentic")
+	}
+	if strings.HasSuffix(upstream, "-thinking") {
+		thinking = true
+		upstream = strings.TrimSuffix(upstream, "-thinking")
+	}
+	return
+}
+
 // buildKiroPayload converts an OpenAI-format request to CodeWhisperer's
 // GenerateAssistantResponse shape. Behavior is parity with 9router's
 // openai-to-kiro translator: full history, tools, toolUses, toolResults,
 // images, deterministic conversationId.
 func (e *KiroExecutor) buildKiroPayload(openaiBody []byte, model string, auth *cliproxyauth.Auth) ([]byte, error) {
+	// Resolve -thinking/-agentic suffix → strip from modelId sent to AWS,
+	// inject corresponding system-prompt prefixes into user content.
+	upstreamModel, thinkingEnabled, agenticEnabled := resolveKiroModelSuffix(model)
+
 	messages := gjson.GetBytes(openaiBody, "messages").Array()
 	tools := gjson.GetBytes(openaiBody, "tools").Array()
 
-	history, currentMessage, err := convertKiroMessages(messages, tools, model)
+	history, currentMessage, err := convertKiroMessages(messages, tools, upstreamModel)
 	if err != nil {
 		return nil, err
 	}
 
 	finalContent, _ := getKiroUserInputString(currentMessage, "content")
-	finalContent = fmt.Sprintf("[Context: Current time is %s]\n\n%s",
-		time.Now().UTC().Format(time.RFC3339), finalContent)
+
+	// Build prefix parts in the same order as 9router (line 326-334):
+	// thinking_mode → [Context: timestamp] → agentic prompt → user content.
+	var prefixParts []string
+	if thinkingEnabled {
+		prefixParts = append(prefixParts, kiroThinkingPrefix)
+	}
+	prefixParts = append(prefixParts, fmt.Sprintf("[Context: Current time is %s]", time.Now().UTC().Format(time.RFC3339)))
+	if agenticEnabled {
+		prefixParts = append(prefixParts, kiroAgenticPrompt)
+	}
+	finalContent = strings.Join(prefixParts, "\n\n") + "\n\n" + finalContent
 
 	currentUserInput := map[string]any{
 		"content": finalContent,
-		"modelId": model,
+		"modelId": upstreamModel,
 		"origin":  "AI_EDITOR",
 	}
 	if currentMessage != nil {

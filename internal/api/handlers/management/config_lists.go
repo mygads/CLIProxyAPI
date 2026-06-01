@@ -942,6 +942,10 @@ func (h *Handler) PatchOAuthModelAlias(c *gin.Context) {
 		h.persist(c)
 		return
 	}
+	// Auto-create the channel map if it doesn't exist yet so operators can
+	// add model aliases for a new provider (e.g. "kr") without having to
+	// pre-create the channel via a separate call. Mirrors the behaviour
+	// expected by the management UI's "Add model" flow.
 	if h.cfg.OAuthModelAlias == nil {
 		h.cfg.OAuthModelAlias = make(map[string][]config.OAuthModelAlias)
 	}
