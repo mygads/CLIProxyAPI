@@ -80,8 +80,20 @@ const (
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
 	// burn CPU at idle.
 	refreshIneffectiveBackoff = 30 * time.Second
-	quotaBackoffBase          = time.Second
-	quotaBackoffMax           = 30 * time.Minute
+	// Quota backoff for providers that 429 WITHOUT a Retry-After. Matches
+	// 9router's BACKOFF_CONFIG (base 2s, cap 5min). Providers that supply a
+	// concrete cooldown (e.g. Kiro's flat 60s RetryAfter, set in the Kiro
+	// executor for overlimit-aware short rests) bypass this escalation.
+	quotaBackoffBase = 2 * time.Second
+	quotaBackoffMax  = 5 * time.Minute
+
+	// Per-status credential cooldowns. Aligned with 9router's errorConfig
+	// (auth errors 2min, transient 30s) so a temporarily-failing credential
+	// returns to rotation quickly instead of being parked for 30min/12h.
+	// Genuinely dead credentials are disabled by an operator; the circuit
+	// breaker is the automatic backstop for repeated failures.
+	cooldownAuthError = 2 * time.Minute  // 401 / 402 / 403 / 404
+	cooldownTransient = 30 * time.Second // 408 / 5xx
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -2369,7 +2381,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(30 * time.Minute)
+								next := now.Add(cooldownAuthError)
 								state.NextRetryAfter = next
 								suspendReason = "unauthorized"
 								shouldSuspendModel = true
@@ -2378,7 +2390,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(30 * time.Minute)
+								next := now.Add(cooldownAuthError)
 								state.NextRetryAfter = next
 								suspendReason = "payment_required"
 								shouldSuspendModel = true
@@ -2387,7 +2399,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(12 * time.Hour)
+								next := now.Add(cooldownAuthError)
 								state.NextRetryAfter = next
 								suspendReason = "not_found"
 								shouldSuspendModel = true
@@ -2422,7 +2434,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(1 * time.Minute)
+								next := now.Add(cooldownTransient)
 								state.NextRetryAfter = next
 							}
 						default:
@@ -3041,21 +3053,21 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
 		} else {
-			auth.NextRetryAfter = now.Add(30 * time.Minute)
+			auth.NextRetryAfter = now.Add(cooldownAuthError)
 		}
 	case 402, 403:
 		auth.StatusMessage = "payment_required"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
 		} else {
-			auth.NextRetryAfter = now.Add(30 * time.Minute)
+			auth.NextRetryAfter = now.Add(cooldownAuthError)
 		}
 	case 404:
 		auth.StatusMessage = "not_found"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
 		} else {
-			auth.NextRetryAfter = now.Add(12 * time.Hour)
+			auth.NextRetryAfter = now.Add(cooldownAuthError)
 		}
 	case 429:
 		auth.StatusMessage = "quota exhausted"
@@ -3080,7 +3092,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
 		} else {
-			auth.NextRetryAfter = now.Add(1 * time.Minute)
+			auth.NextRetryAfter = now.Add(cooldownTransient)
 		}
 	default:
 		if auth.StatusMessage == "" {

@@ -141,7 +141,10 @@ func Refresh(ctx context.Context, refreshToken string) (*RefreshResponse, error)
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("kiro refresh: status %d", resp.StatusCode)
+		return nil, &authError{
+			HTTPStatus: refreshFailureStatus(resp.StatusCode),
+			Message:    fmt.Sprintf("kiro refresh: status %d", resp.StatusCode),
+		}
 	}
 
 	var out RefreshResponse

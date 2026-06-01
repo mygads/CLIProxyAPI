@@ -186,3 +186,28 @@ type authError struct {
 }
 
 func (e *authError) Error() string { return e.Message }
+
+// StatusCode exposes the HTTP-like status so the conductor's
+// errors.AsType[StatusError] unwrap (through fmt.Errorf %w chains) can
+// read it and apply the right cooldown. Without this a refresh failure
+// surfaced as status 0 (default bucket → NO cooldown), so a credential
+// whose refresh token is dead got re-selected on every request — the
+// "zombie credential" gap.
+func (e *authError) StatusCode() int { return e.HTTPStatus }
+
+// refreshFailureStatus maps a refresh-endpoint HTTP status onto the
+// credential-level status the rotation layer should act on:
+//   - 429            → 429 (refresh itself rate-limited; short cooldown)
+//   - 5xx            → 503 (transient; short cooldown, retry soon)
+//   - anything else  → 401 (refresh rejected = credential can't
+//     authenticate, e.g. invalid_grant/revoked → unauthorized cooldown)
+func refreshFailureStatus(upstream int) int {
+	switch {
+	case upstream == http.StatusTooManyRequests:
+		return http.StatusTooManyRequests
+	case upstream >= 500:
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusUnauthorized
+	}
+}

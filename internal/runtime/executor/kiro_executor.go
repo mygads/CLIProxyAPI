@@ -760,14 +760,60 @@ func parseKiroToolInput(v gjson.Result) any {
 	return map[string]any{}
 }
 
-// isKiroRetriableBody returns true when a Kiro 400 response indicates a
-// per-account model availability issue rather than a genuinely malformed
-// request. These errors should trigger a retry with a different account.
-func isKiroRetriableBody(body []byte) bool {
+// kiroRateLimitCooldown is the flat cooldown applied when a Kiro account
+// reports a rate-limit / "reached the limit" response. Kiro accounts
+// "overlimit" (a nominal 1k cap often keeps serving well past it), so we
+// deliberately avoid the conductor's escalating quota backoff: the account
+// is rested briefly then returns to rotation. Operators disable genuinely
+// dead accounts manually; the circuit breaker is the automatic backstop.
+const kiroRateLimitCooldown = 60 * time.Second
+
+// classifyKiroError normalizes a Kiro upstream failure into the canonical
+// status code the conductor acts on, plus an optional fixed RetryAfter.
+//
+//   - rate-limit / quota (HTTP 429, or a 400 body carrying a limit phrase)
+//     -> 429 + a flat 60s RetryAfter so the conductor applies a short
+//     non-escalating cooldown (overlimit-aware, per operator policy).
+//   - per-account transient quirks (malformed framing / invalid model on
+//     this credential) -> 503 so the loop rotates to another account.
+//   - everything else -> the upstream status unchanged.
+func classifyKiroError(status int, body []byte) (int, *time.Duration) {
 	lower := strings.ToLower(string(body))
-	return strings.Contains(lower, "improperly formed request") ||
+	if status == http.StatusTooManyRequests ||
 		strings.Contains(lower, "you have reached the limit") ||
-		strings.Contains(lower, "invalid model")
+		strings.Contains(lower, "reached the limit") ||
+		strings.Contains(lower, "too many requests") ||
+		strings.Contains(lower, "rate limit") ||
+		strings.Contains(lower, "rate-limit") {
+		d := kiroRateLimitCooldown
+		return http.StatusTooManyRequests, &d
+	}
+	if status == http.StatusBadRequest &&
+		(strings.Contains(lower, "improperly formed request") ||
+			strings.Contains(lower, "invalid model")) {
+		return http.StatusServiceUnavailable, nil
+	}
+	return status, nil
+}
+
+// kiroRetryPlan returns (maxRetries, delay) for retrying the SAME
+// credential on a transient/quota status before the conductor rotates to
+// the next credential. Mirrors 9router's per-status Kiro retry config
+// (429:2x@2s, 502:3x@3s, 503:3x@2s, 504:2x@3s). A zero count means "do not
+// retry this credential here — let the rotation layer move on".
+func kiroRetryPlan(status int) (int, time.Duration) {
+	switch status {
+	case http.StatusTooManyRequests:
+		return 2, 2 * time.Second
+	case http.StatusBadGateway:
+		return 3, 3 * time.Second
+	case http.StatusServiceUnavailable:
+		return 3, 2 * time.Second
+	case http.StatusGatewayTimeout:
+		return 2, 3 * time.Second
+	default:
+		return 0, 0
+	}
 }
 
 func orFallback(s, fallback string) string {
@@ -846,7 +892,6 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 	httpResp, err := e.doKiroRequest(ctx, auth, kiroBody)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
 	defer func() {
@@ -854,16 +899,6 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 			log.Errorf("kiro executor: close body: %v", errClose)
 		}
 	}()
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		code := httpResp.StatusCode
-		if code == 400 && isKiroRetriableBody(b) {
-			code = http.StatusServiceUnavailable
-		}
-		return resp, statusErr{code: code, msg: string(b)}
-	}
 
 	assembled, err := assembleKiroResponse(ctx, e.cfg, httpResp.Body, baseModel, openaiBody)
 	if err != nil {
@@ -916,21 +951,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 
 	httpResp, err := e.doKiroRequest(ctx, auth, kiroBody)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
-	}
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("kiro executor: close body: %v", errClose)
-		}
-		code := httpResp.StatusCode
-		if code == 400 && isKiroRetriableBody(b) {
-			code = http.StatusServiceUnavailable
-		}
-		return nil, statusErr{code: code, msg: string(b)}
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -946,14 +967,30 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
 
-// doKiroRequest builds and sends a single CodeWhisperer request, handling
-// the one-shot 401 retry pattern. On 401 the access token is invalidated
-// so the next attempt forces a refresh.
+// doKiroRequest builds and sends a CodeWhisperer request for a single
+// credential, with bounded same-credential retries before the conductor
+// rotates to the next credential:
+//
+//   - 401 (once): invalidate the cached token so ensureAccessToken forces a
+//     refresh, then retry. A second 401 returns so the conductor cools the
+//     credential down ("unauthorized").
+//   - 429 / 5xx: retry the SAME credential per kiroRetryPlan (9router's
+//     per-status Kiro config) before giving up so the conductor rotates.
+//   - other non-2xx: returned immediately (classified) — no same-credential
+//     retry, let rotation move on.
+//
+// On any error this returns (nil, err); the upstream response body is read,
+// request-logged, and folded into a statusErr so the caller does not repeat
+// that work. On success it returns the live *http.Response with body intact
+// (the streaming path needs the unread body).
 func (e *KiroExecutor) doKiroRequest(ctx context.Context, auth *cliproxyauth.Auth, body []byte) (*http.Response, error) {
-	var lastResp *http.Response
-	for attempt := 0; attempt < 2; attempt++ {
+	refreshedOn401 := false
+	rateLimitRetries := 0
+	transientRetries := 0
+	for {
 		token, err := e.ensureAccessToken(ctx, auth)
 		if err != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
 			return nil, err
 		}
 		url := kiroURL(auth)
@@ -990,27 +1027,52 @@ func (e *KiroExecutor) doKiroRequest(ctx context.Context, auth *cliproxyauth.Aut
 		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, e.cfg.UpstreamTimeout())
 		resp, err := httpClient.Do(httpReq)
 		if err != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
 			return nil, err
 		}
-		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
+
+		// Success: hand the live response (body intact) to the caller.
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
+			return resp, nil
+		}
+
+		// One-shot refresh-retry on 401.
+		if resp.StatusCode == http.StatusUnauthorized && !refreshedOn401 {
 			_ = resp.Body.Close()
-			// Invalidate cached access token so the next ensure call refreshes.
+			refreshedOn401 = true
 			if auth != nil && auth.Metadata != nil {
 				delete(auth.Metadata, "access_token")
 				auth.Metadata["expires_at"] = int64(0)
 			}
 			continue
 		}
-		lastResp = resp
-		break
-	}
-	if lastResp == nil {
-		return nil, &cliproxyauth.Error{
-			HTTPStatus: http.StatusUnauthorized,
-			Message:    "kiro: persistent 401 after token refresh",
+
+		// Non-2xx: read + request-log the body, then classify.
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
+		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+
+		normStatus, retryAfter := classifyKiroError(resp.StatusCode, b)
+
+		maxRetries, delay := kiroRetryPlan(normStatus)
+		retries := &transientRetries
+		if normStatus == http.StatusTooManyRequests {
+			retries = &rateLimitRetries
 		}
+		if maxRetries > 0 && *retries < maxRetries {
+			*retries++
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+			continue
+		}
+
+		return nil, statusErr{code: normStatus, msg: string(b), retryAfter: retryAfter}
 	}
-	return lastResp, nil
 }
 
 // kiroStreamState accumulates per-response data while walking the
