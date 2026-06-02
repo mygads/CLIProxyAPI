@@ -1,9 +1,12 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 )
+
+const customerGatewayBusyMessage = "The requested model/provider is currently experiencing high traffic. Please try again later."
 
 // internalKeywords are substrings indicating an internal infrastructure detail
 // has leaked into an error message and must be redacted before reaching customers.
@@ -39,53 +42,20 @@ func containsInternalLeak(s string) bool {
 // safeMessageForStatus returns a generic customer-facing message for the
 // given HTTP status code. No internal details are exposed.
 func safeMessageForStatus(status int) string {
-	switch {
-	case status == 429:
-		return "Rate limit exceeded. Please retry shortly."
-	case status == 503:
-		return "Service temporarily unavailable. Please retry shortly."
-	case status >= 500:
-		return "An upstream error occurred. Please retry your request."
-	case status == 401 || status == 403:
-		return "Authentication or permission error."
-	case status == 404:
-		return "The requested resource was not found."
-	default:
-		return "An error occurred while processing your request."
-	}
+	return customerGatewayBusyMessage
 }
 
 // sanitizeErrorText replaces a raw error string with a safe message if it
 // contains internal infrastructure leaks; otherwise returns it unchanged.
 func sanitizeErrorText(errText string, status int) string {
-	if containsInternalLeak(errText) {
-		return safeMessageForStatus(status)
-	}
-	return errText
+	return safeMessageForStatus(status)
 }
 
-// sanitizeUpstreamErrorJSON parses an upstream JSON error body, redacts
-// internal details (provider names, model names, litellm/CLIProxy mentions,
-// cooldown specifics), and returns a safe JSON body. The shape of the
-// outermost object is preserved when possible so SDK clients still see a
-// `{"error":{"message":...}}` envelope.
+// sanitizeUpstreamErrorJSON replaces every public error body with a safe
+// OpenAI-compatible envelope. The original errText remains available to the
+// request logger/error metadata before this body is sent to the customer.
 func sanitizeUpstreamErrorJSON(body []byte, status int) []byte {
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		// Not parseable JSON — fall back to a fully synthetic safe body.
-		return buildFallbackErrorJSON(status)
-	}
-
-	if !sanitizeJSONValueInPlace(payload, status) {
-		// Nothing leaked — return the body unchanged.
-		return body
-	}
-
-	out, err := json.Marshal(payload)
-	if err != nil {
-		return buildFallbackErrorJSON(status)
-	}
-	return out
+	return buildFallbackErrorJSON(status)
 }
 
 // sanitizeJSONValueInPlace walks the parsed JSON value and replaces leaky
@@ -163,4 +133,78 @@ func buildFallbackErrorJSON(status int) []byte {
 	}
 	out, _ := json.Marshal(payload)
 	return out
+}
+
+// SanitizePublicResponse rewrites a successful public response before it is
+// sent to customers. Combo routing may execute a hidden upstream model; this
+// function forces any response model fields back to the requested public model
+// and removes provider-specific reasoning_content fields.
+func SanitizePublicResponse(body []byte, publicModel string) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	if !bytes.Contains(body, []byte(`"model"`)) && !bytes.Contains(body, []byte(`"reasoning_content"`)) && !bytes.Contains(body, []byte(`"error"`)) {
+		return body
+	}
+
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+
+	changed := sanitizePublicJSONInPlace(payload, publicModel)
+	if !changed {
+		return body
+	}
+
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+func sanitizePublicJSONInPlace(value any, publicModel string) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		changed := false
+		for key, nested := range typed {
+			lowerKey := strings.ToLower(key)
+			if lowerKey == "error" {
+				typed[key] = map[string]any{
+					"message": safeMessageForStatus(0),
+					"type":    "server_error",
+					"code":    "upstream_error",
+				}
+				changed = true
+				continue
+			}
+			if lowerKey == "reasoning_content" {
+				delete(typed, key)
+				changed = true
+				continue
+			}
+			if lowerKey == "model" && publicModel != "" {
+				if current, ok := nested.(string); ok && current != publicModel {
+					typed[key] = publicModel
+					changed = true
+					continue
+				}
+			}
+			if sanitizePublicJSONInPlace(nested, publicModel) {
+				changed = true
+			}
+		}
+		return changed
+	case []any:
+		changed := false
+		for _, nested := range typed {
+			if sanitizePublicJSONInPlace(nested, publicModel) {
+				changed = true
+			}
+		}
+		return changed
+	default:
+		return false
+	}
 }

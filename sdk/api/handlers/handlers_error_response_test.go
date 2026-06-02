@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -113,5 +114,33 @@ func TestEnrichAuthSelectionError_IgnoresOtherErrors(t *testing.T) {
 	out := enrichAuthSelectionError(in, []string{"claude"}, "claude-sonnet-4-6")
 	if out != in {
 		t.Fatalf("expected original error to be returned unchanged")
+	}
+}
+
+func TestBuildErrorResponseBodyMasksProviderCatalogError(t *testing.T) {
+	body := BuildErrorResponseBody(http.StatusBadRequest, `{"error":{"code":"invalid_request_error","message":"Model \"deepseek-v4-pro\" is not available in current public model catalog.","type":"invalid_request_error","upstream_status":400}}`)
+
+	if strings.Contains(string(body), "deepseek") || strings.Contains(string(body), "model catalog") {
+		t.Fatalf("provider error leaked: %s", body)
+	}
+
+	var payload ErrorResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Error.Message != customerGatewayBusyMessage {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, customerGatewayBusyMessage)
+	}
+}
+
+func TestSanitizePublicResponseRewritesModelAndDropsReasoningContent(t *testing.T) {
+	body := []byte(`{"id":"x","object":"chat.completion","model":"deepseek/deepseek-v4-pro","choices":[{"message":{"role":"assistant","content":"ok","reasoning_content":"provider thoughts"}}]}`)
+	out := SanitizePublicResponse(body, "genfity/claude-opus-4.7")
+
+	if strings.Contains(string(out), "deepseek") || strings.Contains(string(out), "reasoning_content") || strings.Contains(string(out), "provider thoughts") {
+		t.Fatalf("internal response detail leaked: %s", out)
+	}
+	if !strings.Contains(string(out), "genfity/claude-opus-4.7") {
+		t.Fatalf("public model missing: %s", out)
 	}
 }

@@ -604,7 +604,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	for _, attempt := range h.resolveModelAttempts(modelName) {
 		resp, headers, errMsg := h.executeSingle(ctx, handlerType, attempt.Model, rawJSON, alt)
 		if errMsg == nil {
-			return resp, headers, nil
+			return SanitizePublicResponse(resp, modelName), headers, nil
 		}
 		if attempt.IsLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
 			return nil, nil, errMsg
@@ -769,7 +769,8 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		if len(attempts) == 1 {
 			target = attempts[0].Model
 		}
-		return h.executeStreamSingle(ctx, handlerType, target, rawJSON, alt)
+		data, headers, errs := h.executeStreamSingle(ctx, handlerType, target, rawJSON, alt)
+		return sanitizePublicStream(data, modelName), headers, errs
 	}
 
 	// Multi-candidate combo path. Try each entry; the first one that
@@ -798,7 +799,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 			// Pump bytes/errors. forwardStreamAttempt returns true when
 			// any payload was forwarded — at that point we are committed
 			// and cannot fall back regardless of subsequent errors.
-			committed, errMsg := forwardStreamAttempt(ctx, subData, subErr, dataChan, errChan, headers, subHeaders)
+			committed, errMsg := forwardStreamAttempt(ctx, subData, subErr, dataChan, errChan, headers, subHeaders, modelName)
 			if committed {
 				return
 			}
@@ -825,6 +826,20 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	return dataChan, headers, errChan
 }
 
+func sanitizePublicStream(data <-chan []byte, publicModel string) <-chan []byte {
+	if data == nil {
+		return data
+	}
+	out := make(chan []byte)
+	go func() {
+		defer close(out)
+		for chunk := range data {
+			out <- SanitizePublicResponse(chunk, publicModel)
+		}
+	}()
+	return out
+}
+
 // forwardStreamAttempt drains a single-attempt stream and forwards
 // payload chunks + headers to the caller-facing channels. It returns
 // (committed, errMsg):
@@ -843,6 +858,7 @@ func forwardStreamAttempt(
 	errChan chan<- *interfaces.ErrorMessage,
 	headers http.Header,
 	subHeaders http.Header,
+	publicModel string,
 ) (bool, *interfaces.ErrorMessage) {
 	// Adopt the underlying stream's headers up-front so combo entries
 	// that share a header set still surface the right Content-Type etc.
@@ -861,7 +877,7 @@ func forwardStreamAttempt(
 				continue
 			}
 			committed = true
-			if !sendStreamData(ctx, dataChan, chunk) {
+			if !sendStreamData(ctx, dataChan, SanitizePublicResponse(chunk, publicModel)) {
 				return committed, nil
 			}
 		case msg, ok := <-subErr:
