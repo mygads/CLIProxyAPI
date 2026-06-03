@@ -47,8 +47,13 @@ func safeMessageForStatus(status int) string {
 
 // sanitizeErrorText replaces a raw error string with a safe message if it
 // contains internal infrastructure leaks; otherwise returns it unchanged.
+// Only sanitize when necessary — user-facing errors like "unknown provider for
+// model X" are safe to show and help debugging typos.
 func sanitizeErrorText(errText string, status int) string {
-	return safeMessageForStatus(status)
+	if containsInternalLeak(errText) {
+		return safeMessageForStatus(status)
+	}
+	return errText
 }
 
 // sanitizeUpstreamErrorJSON replaces every public error body with a safe

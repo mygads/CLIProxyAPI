@@ -117,6 +117,55 @@ func TestEnrichAuthSelectionError_IgnoresOtherErrors(t *testing.T) {
 	}
 }
 
+func TestSanitizeErrorText_PreservesSafeMessages(t *testing.T) {
+	tests := []struct {
+		name    string
+		errText string
+		status  int
+		want    string
+	}{
+		{
+			name:    "unknown provider error is safe",
+			errText: "unknown provider for model genfity/Qwen-3.7-Max",
+			status:  http.StatusBadGateway,
+			want:    "unknown provider for model genfity/Qwen-3.7-Max",
+		},
+		{
+			name:    "litellm error contains internal leak",
+			errText: "litellm.exceptions.APIConnectionError: Connection refused",
+			status:  http.StatusInternalServerError,
+			want:    customerGatewayBusyMessage,
+		},
+		{
+			name:    "mtr prefix error contains internal leak",
+			errText: "mtr/anthropic claude-3-opus-20240229 rate limit exceeded",
+			status:  http.StatusTooManyRequests,
+			want:    customerGatewayBusyMessage,
+		},
+		{
+			name:    "generic error is safe",
+			errText: "rate limit exceeded",
+			status:  http.StatusTooManyRequests,
+			want:    "rate limit exceeded",
+		},
+		{
+			name:    "empty error",
+			errText: "",
+			status:  http.StatusBadRequest,
+			want:    "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeErrorText(tt.errText, tt.status)
+			if got != tt.want {
+				t.Errorf("sanitizeErrorText(%q, %d) = %q, want %q", tt.errText, tt.status, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildErrorResponseBodyMasksProviderCatalogError(t *testing.T) {
 	body := BuildErrorResponseBody(http.StatusBadRequest, `{"error":{"code":"invalid_request_error","message":"Model \"deepseek-v4-pro\" is not available in current public model catalog.","type":"invalid_request_error","upstream_status":400}}`)
 
