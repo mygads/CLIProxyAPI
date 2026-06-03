@@ -358,39 +358,80 @@ func (r *Registry) Resolve(name string) ([]Candidate, bool) {
 	return candidates, true
 }
 
+// modelNotFoundBodyPatterns are case-insensitive substrings that indicate a
+// 400 response body is a "model not found" or "model not available" error
+// rather than a client-side validation error. When a combo entry returns 400
+// matching one of these patterns, the resolver should fall through to the next
+// entry instead of surfacing the error — a subsequent provider may serve the
+// same model under a different name.
+var modelNotFoundBodyPatterns = []string{
+	"not available in current public model catalog",
+	"model_not_found",
+	"model not found",
+}
+
 // ShouldFallback reports whether an upstream response should trigger the next
 // combo candidate. It combines two signals:
 //
 //   - A retriable HTTP status (429, 500, 502, 503, 504) always triggers.
+//   - HTTP 400 triggers only when the body contains a "model not found" pattern
+//     (validation errors like malformed JSON are not retriable).
 //   - If the entry declares TriggerOn keywords, the response body must also
 //     contain at least one of them (case-insensitive substring match).
 //
 // An empty TriggerOn slice means "any retriable status triggers" — this is
 // the same behaviour the removed genfity-gateway combo had.
 func ShouldFallback(status int, body []byte, triggers []string) bool {
+	// HTTP 400 is retriable only when the body indicates a model-not-found
+	// error. Validation errors (bad JSON, missing fields) should NOT trigger
+	// fallback because the next combo entry would fail identically.
+	if status == 400 {
+		text := strings.ToLower(string(body))
+		if !containsAnySubstring(text, modelNotFoundBodyPatterns) {
+			return false
+		}
+		// If we have trigger keywords, also check them.
+		if len(triggers) > 0 && !matchesAnyTrigger(text, triggers) {
+			return false
+		}
+		return true
+	}
+
 	if !isRetriableStatus(status) {
 		return false
 	}
 	if len(triggers) == 0 {
 		return true
 	}
-	haystack := strings.ToLower(string(body))
-	for _, t := range triggers {
-		needle := strings.ToLower(strings.TrimSpace(t))
-		if needle == "" {
-			continue
-		}
-		if strings.Contains(haystack, needle) {
-			return true
-		}
-	}
-	return false
+	text := strings.ToLower(string(body))
+	return matchesAnyTrigger(text, triggers)
 }
 
 func isRetriableStatus(code int) bool {
 	switch code {
 	case 429, 500, 502, 503, 504:
 		return true
+	}
+	return false
+}
+
+func containsAnySubstring(text string, patterns []string) bool {
+	for _, p := range patterns {
+		if strings.Contains(text, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesAnyTrigger(text string, triggers []string) bool {
+	for _, t := range triggers {
+		if t == "" {
+			continue
+		}
+		if strings.Contains(text, strings.ToLower(strings.TrimSpace(t))) {
+			return true
+		}
 	}
 	return false
 }

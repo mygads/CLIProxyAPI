@@ -189,6 +189,45 @@ func TestShouldFallback_triggerKeywordMatch(t *testing.T) {
 	}
 }
 
+func TestShouldFallback_400ModelNotFound(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     []byte
+		triggers []string
+		want     bool
+	}{
+		{
+			name: "public model catalog error",
+			body: []byte(`{"error":{"code":"invalid_request_error","message":"Model \"kimi-k2.6\" is not available in current public model catalog.","type":"invalid_request_error"}}`),
+			want: true,
+		},
+		{
+			name: "model not found",
+			body: []byte(`{"error":{"message":"model_not_found","type":"not_found_error"}}`),
+			want: true,
+		},
+		{
+			name: "validation error should NOT retry",
+			body: []byte(`{"error":{"message":"Invalid JSON: unexpected end of input"}}`),
+			want: false,
+		},
+		{
+			name:     "model catalog error with non-matching trigger",
+			body:     []byte(`Model "x" is not available in current public model catalog.`),
+			triggers: []string{"quota_exceeded"},
+			want:     false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ShouldFallback(400, tc.body, tc.triggers)
+			if got != tc.want {
+				t.Errorf("status 400: want %v, got %v", tc.want, got)
+			}
+		})
+	}
+}
+
 func TestRegistry_upsertReplacesAndDeleteClears(t *testing.T) {
 	r := NewRegistry()
 	_ = r.Upsert(&Combo{
