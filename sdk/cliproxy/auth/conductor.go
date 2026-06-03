@@ -2948,6 +2948,14 @@ func isModelSupportErrorMessage(message string) bool {
 		"model unavailable",
 		"not available for your plan",
 		"not available for your account",
+		// Public-catalog rejections — see sdk/api/handlers/handlers.go
+		// isModelSupportBodyMessage. The conductor's copy must stay in sync
+		// so a single failing 400 from a removed-model upstream both suspends
+		// the auth AND lets the combo fall through to the next entry.
+		"not available in current public model catalog",
+		"is not available in current public model catalog",
+		"is not in the public model catalog",
+		"is not available in this account's model catalog",
 	}
 	for _, pattern := range patterns {
 		if strings.Contains(lower, pattern) {

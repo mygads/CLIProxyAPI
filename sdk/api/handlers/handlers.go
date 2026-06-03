@@ -1476,6 +1476,14 @@ func isModelSupportBodyMessage(body string) bool {
 		"model unavailable",
 		"not available for your plan",
 		"not available for your account",
+		// Public-catalog rejections — the upstream removed the model from its
+		// served catalog (e.g. kvc "Model ... is not available in current
+		// public model catalog"). Same shape: this auth/upstream cannot serve
+		// the model right now, so the combo loop should fall through.
+		"not available in current public model catalog",
+		"is not available in current public model catalog",
+		"is not in the public model catalog",
+		"is not available in this account's model catalog",
 	}
 	for _, pattern := range patterns {
 		if strings.Contains(lower, pattern) {

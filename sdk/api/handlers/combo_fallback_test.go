@@ -285,6 +285,14 @@ func TestComboShouldFallback_modelNotSupportedFallsThrough(t *testing.T) {
 		"unsupported model: gpt-5.5",
 		"model unavailable",
 		"This model is not available for your account",
+		// Public-catalog rejection (kvc upstream, June 2026): the model was
+		// removed from the served catalog. The 400 carries an
+		// `invalid_request_error` type which the deny-list would otherwise
+		// catch — the "is not available in current public model catalog"
+		// substring must lift it back into the "this auth cannot serve this
+		// model, try the next entry" bucket.
+		`{"error":{"code":"invalid_request_error","message":"Model \"qwen3.7-max\" is not available in current public model catalog.","type":"invalid_request_error","upstream_status":400}}`,
+		"Model \"kimi-k2.6\" is not available in current public model catalog.",
 	}
 	for _, body := range bodies {
 		msg := &interfaces.ErrorMessage{StatusCode: 400, Error: errors.New(body)}
