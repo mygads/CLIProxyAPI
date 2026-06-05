@@ -664,6 +664,11 @@ func (h *BaseAPIHandler) executeSingle(ctx context.Context, handlerType, modelNa
 		}
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 	}
+	normalizedPayload, normalizeErr := normalizeNonStreamingPayload(resp.Payload)
+	if normalizeErr != nil {
+		return nil, nil, normalizeErr
+	}
+	resp.Payload = normalizedPayload
 	if !PassthroughHeadersEnabled(h.Cfg) {
 		return resp.Payload, nil, nil
 	}
