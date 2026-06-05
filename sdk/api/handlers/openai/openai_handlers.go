@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -503,7 +502,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 	// → HTTP 524 to the client).
 	setSSEHeaders()
 	c.Status(http.StatusOK)
-	_, _ = c.Writer.Write([]byte(": connected " + strings.Repeat("-", 32*1024) + "\n\n"))
+	_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
 	flusher.Flush()
 
 	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
@@ -663,7 +662,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 
 	setSSEHeaders()
 	c.Status(http.StatusOK)
-	_, _ = c.Writer.Write([]byte(": connected " + strings.Repeat("-", 32*1024) + "\n\n"))
+	_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
 	flusher.Flush()
 
 	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)

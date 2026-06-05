@@ -245,7 +245,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	// though origin is healthy.
 	setSSEHeaders()
 	c.Status(http.StatusOK)
-	_, _ = c.Writer.Write([]byte(": connected " + strings.Repeat("-", 32*1024) + "\n\n"))
+	_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
 	flusher.Flush()
 
 	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
@@ -257,9 +257,9 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	// thread can keep the connection warm with periodic heartbeats
 	// until the channels become available.
 	type bootstrapResult struct {
-		dataChan  <-chan []byte
-		headers   http.Header
-		errChan   <-chan *interfaces.ErrorMessage
+		dataChan <-chan []byte
+		headers  http.Header
+		errChan  <-chan *interfaces.ErrorMessage
 	}
 	bootstrap := make(chan bootstrapResult, 1)
 	go func() {

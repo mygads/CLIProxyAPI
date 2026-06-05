@@ -14,7 +14,6 @@ import (
 	"io"
 	"net/http"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -499,7 +498,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 
 	setSSEHeaders()
 	c.Status(http.StatusOK)
-	_, _ = c.Writer.Write([]byte(": connected " + strings.Repeat("-", 32*1024) + "\n\n"))
+	_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
 	flusher.Flush()
 
 	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)

@@ -836,7 +836,7 @@ func sanitizePublicStream(data <-chan []byte, publicModel string) <-chan []byte 
 		defer close(out)
 		for chunk := range data {
 			safe := sanitizePublicResponseWithState(chunk, publicModel, sanitizer)
-			if len(safe) == 0 {
+			if len(safe) == 0 || !publicChunkHasVisibleContent(safe) {
 				continue
 			}
 			out <- safe
@@ -882,7 +882,7 @@ func forwardStreamAttempt(
 				continue
 			}
 			safe := sanitizePublicResponseWithState(chunk, sanitizer.publicModel, sanitizer)
-			if len(safe) == 0 {
+			if len(safe) == 0 || !publicChunkHasVisibleContent(safe) {
 				continue
 			}
 			committed = true

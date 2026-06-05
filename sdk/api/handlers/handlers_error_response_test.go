@@ -251,6 +251,9 @@ func TestSanitizePublicStream_StripsThinkingAcrossChunks(t *testing.T) {
 	if strings.Contains(joined, ": connected") {
 		t.Fatalf("provider prelude leaked: %s", joined)
 	}
+	if strings.Contains(joined, `"content":""`) {
+		t.Fatalf("empty content chunks should be suppressed: %s", joined)
+	}
 	if strings.Contains(joined, "genflowai/claude-haiku-4.5-thinking-agentic") {
 		t.Fatalf("upstream model leaked: %s", joined)
 	}

@@ -413,6 +413,13 @@ func payloadHasVisiblePublicContent(value any) bool {
 				if current, ok := nested.(string); ok && strings.TrimSpace(current) != "" {
 					return true
 				}
+			case "type":
+				if current, ok := nested.(string); ok {
+					current = strings.TrimSpace(current)
+					if strings.HasPrefix(current, "response.") || current == "response" || current == "error" {
+						return true
+					}
+				}
 			case "finish_reason":
 				switch v := nested.(type) {
 				case string:
@@ -438,4 +445,22 @@ func payloadHasVisiblePublicContent(value any) bool {
 		}
 	}
 	return false
+}
+
+func publicChunkHasVisibleContent(chunk []byte) bool {
+	trimmed := bytes.TrimSpace(chunk)
+	if len(trimmed) == 0 {
+		return false
+	}
+	if looksLikeSSEChunk(trimmed) {
+		return true
+	}
+	if !json.Valid(trimmed) {
+		return true
+	}
+	var payload any
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		return true
+	}
+	return payloadHasVisiblePublicContent(payload)
 }
