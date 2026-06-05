@@ -219,13 +219,42 @@ func TestSanitizePublicResponse_RewritesSSEChunkAndMasksProviderPrelude(t *testi
 	if strings.Contains(text, "genflowai/claude-opus-4.8-thinking-agentic") || strings.Contains(text, "reasoning_content") || strings.Contains(text, "internal reasoning") {
 		t.Fatalf("internal stream detail leaked: %s", out)
 	}
-	if !strings.Contains(text, ": keep-alive") {
-		t.Fatalf("provider prelude comment was not normalized: %s", out)
+	if strings.Contains(text, "genflowaistreamopen") {
+		t.Fatalf("provider prelude comment leaked: %s", out)
 	}
 	if !strings.Contains(text, "genfity/claude-opus-4.8") {
 		t.Fatalf("public model missing from stream chunk: %s", out)
 	}
 	if !strings.Contains(text, `"content":"ok"`) {
 		t.Fatalf("sanitized stream content missing: %s", out)
+	}
+}
+
+func TestSanitizePublicStream_StripsThinkingAcrossChunks(t *testing.T) {
+	in := make(chan []byte, 6)
+	in <- []byte(": connected -----\n\n")
+	in <- []byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}],\"model\":\"genflowai/claude-haiku-4.5-thinking-agentic\",\"object\":\"chat.completion.chunk\"}\n\n")
+	in <- []byte("data: {\"choices\":[{\"delta\":{\"content\":\"<thinking>internal\"},\"index\":0}],\"model\":\"genflowai/claude-haiku-4.5-thinking-agentic\",\"object\":\"chat.completion.chunk\"}\n\n")
+	in <- []byte("data: {\"choices\":[{\"delta\":{\"content\":\" reasoning\"},\"index\":0}],\"model\":\"genflowai/claude-haiku-4.5-thinking-agentic\",\"object\":\"chat.completion.chunk\"}\n\n")
+	in <- []byte("data: {\"choices\":[{\"delta\":{\"content\":\"</thinking>ok\"},\"index\":0}],\"model\":\"genflowai/claude-haiku-4.5-thinking-agentic\",\"object\":\"chat.completion.chunk\"}\n\n")
+	in <- []byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"model\":\"genflowai/claude-haiku-4.5-thinking-agentic\",\"object\":\"chat.completion.chunk\"}\n\n")
+	close(in)
+
+	var chunks []string
+	for chunk := range sanitizePublicStream(in, "genfity/claude-haiku-4.5") {
+		chunks = append(chunks, string(chunk))
+	}
+	joined := strings.Join(chunks, "")
+	if strings.Contains(strings.ToLower(joined), "<thinking>") || strings.Contains(joined, "internal reasoning") {
+		t.Fatalf("thinking leaked across chunks: %s", joined)
+	}
+	if strings.Contains(joined, ": connected") {
+		t.Fatalf("provider prelude leaked: %s", joined)
+	}
+	if strings.Contains(joined, "genflowai/claude-haiku-4.5-thinking-agentic") {
+		t.Fatalf("upstream model leaked: %s", joined)
+	}
+	if !strings.Contains(joined, "genfity/claude-haiku-4.5") || !strings.Contains(joined, "\"finish_reason\":\"stop\"") || !strings.Contains(joined, "\"content\":\"ok\"") {
+		t.Fatalf("expected sanitized visible stream payload, got %s", joined)
 	}
 }

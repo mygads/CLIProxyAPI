@@ -29,6 +29,15 @@ var internalKeywords = []string{
 
 var thinkingTagPattern = regexp.MustCompile(`(?is)<thinking>\s*.*?\s*</thinking>\s*`)
 
+type publicStreamSanitizer struct {
+	publicModel    string
+	insideThinking bool
+}
+
+func newPublicStreamSanitizer(publicModel string) *publicStreamSanitizer {
+	return &publicStreamSanitizer{publicModel: publicModel}
+}
+
 func containsInternalLeak(s string) bool {
 	if s == "" {
 		return false
@@ -92,7 +101,50 @@ func stripThinkingTags(text string) (string, bool) {
 	return cleaned, cleaned != text
 }
 
+func (s *publicStreamSanitizer) stripThinkingStreamText(text string) (string, bool) {
+	if s == nil || text == "" {
+		return text, false
+	}
+	original := text
+	remaining := text
+	var out strings.Builder
+	changed := false
+
+	for len(remaining) > 0 {
+		lower := strings.ToLower(remaining)
+		if s.insideThinking {
+			end := strings.Index(lower, "</thinking>")
+			if end < 0 {
+				changed = true
+				remaining = ""
+				break
+			}
+			remaining = remaining[end+len("</thinking>"):]
+			s.insideThinking = false
+			changed = true
+			continue
+		}
+
+		start := strings.Index(lower, "<thinking>")
+		if start < 0 {
+			out.WriteString(remaining)
+			break
+		}
+		out.WriteString(remaining[:start])
+		remaining = remaining[start+len("<thinking>"):]
+		s.insideThinking = true
+		changed = true
+	}
+
+	cleaned := out.String()
+	return cleaned, changed || cleaned != original
+}
+
 func sanitizePublicSSEChunk(chunk []byte, publicModel string) []byte {
+	return sanitizePublicSSEChunkWithState(chunk, publicModel, nil)
+}
+
+func sanitizePublicSSEChunkWithState(chunk []byte, publicModel string, streamState *publicStreamSanitizer) []byte {
 	lines := strings.Split(string(chunk), "\n")
 	var result strings.Builder
 	modified := false
@@ -102,7 +154,6 @@ func sanitizePublicSSEChunk(chunk []byte, publicModel string) []byte {
 		switch {
 		case strings.HasPrefix(trimmed, ":"):
 			if strings.TrimSpace(strings.TrimPrefix(trimmed, ":")) != "" {
-				result.WriteString(": keep-alive\n")
 				modified = true
 				continue
 			}
@@ -116,9 +167,13 @@ func sanitizePublicSSEChunk(chunk []byte, publicModel string) []byte {
 			if json.Valid([]byte(data)) {
 				var payload any
 				if err := json.Unmarshal([]byte(data), &payload); err == nil {
-					if sanitizePublicJSONInPlace(payload, publicModel) {
+					if sanitizePublicJSONValueInPlace(payload, publicModel, streamState) {
 						rewritten, err := json.Marshal(payload)
 						if err == nil {
+							if streamState != nil && !payloadHasVisiblePublicContent(payload) {
+								modified = true
+								continue
+							}
 							result.WriteString("data: ")
 							result.Write(rewritten)
 							result.WriteString("\n")
@@ -127,12 +182,26 @@ func sanitizePublicSSEChunk(chunk []byte, publicModel string) []byte {
 						}
 					}
 				}
-			} else if cleaned, changed := stripThinkingTags(data); changed {
-				result.WriteString("data: ")
-				result.WriteString(cleaned)
-				result.WriteString("\n")
-				modified = true
-				continue
+			} else {
+				var (
+					cleaned string
+					changed bool
+				)
+				if streamState != nil {
+					cleaned, changed = streamState.stripThinkingStreamText(data)
+				} else {
+					cleaned, changed = stripThinkingTags(data)
+				}
+				if changed {
+					modified = true
+					if cleaned == "" {
+						continue
+					}
+					result.WriteString("data: ")
+					result.WriteString(cleaned)
+					result.WriteString("\n")
+					continue
+				}
 			}
 		}
 
@@ -232,11 +301,15 @@ func buildFallbackErrorJSON(status int) []byte {
 // function forces any response model fields back to the requested public model
 // and removes provider-specific reasoning_content fields.
 func SanitizePublicResponse(body []byte, publicModel string) []byte {
+	return sanitizePublicResponseWithState(body, publicModel, nil)
+}
+
+func sanitizePublicResponseWithState(body []byte, publicModel string, streamState *publicStreamSanitizer) []byte {
 	if len(body) == 0 {
 		return body
 	}
 	if looksLikeSSEChunk(body) {
-		return sanitizePublicSSEChunk(body, publicModel)
+		return sanitizePublicSSEChunkWithState(body, publicModel, streamState)
 	}
 	if !bytes.Contains(body, []byte(`"model"`)) &&
 		!bytes.Contains(body, []byte(`"reasoning_content"`)) &&
@@ -251,7 +324,7 @@ func SanitizePublicResponse(body []byte, publicModel string) []byte {
 		return body
 	}
 
-	changed := sanitizePublicJSONInPlace(payload, publicModel)
+	changed := sanitizePublicJSONValueInPlace(payload, publicModel, streamState)
 	if !changed {
 		return body
 	}
@@ -264,6 +337,10 @@ func SanitizePublicResponse(body []byte, publicModel string) []byte {
 }
 
 func sanitizePublicJSONInPlace(value any, publicModel string) bool {
+	return sanitizePublicJSONValueInPlace(value, publicModel, nil)
+}
+
+func sanitizePublicJSONValueInPlace(value any, publicModel string, streamState *publicStreamSanitizer) bool {
 	switch typed := value.(type) {
 	case map[string]any:
 		changed := false
@@ -285,7 +362,16 @@ func sanitizePublicJSONInPlace(value any, publicModel string) bool {
 			}
 			if (lowerKey == "content" || lowerKey == "text") && nested != nil {
 				if current, ok := nested.(string); ok {
-					if cleaned, modified := stripThinkingTags(current); modified {
+					var (
+						cleaned  string
+						modified bool
+					)
+					if streamState != nil {
+						cleaned, modified = streamState.stripThinkingStreamText(current)
+					} else {
+						cleaned, modified = stripThinkingTags(current)
+					}
+					if modified {
 						typed[key] = cleaned
 						changed = true
 						continue
@@ -299,7 +385,7 @@ func sanitizePublicJSONInPlace(value any, publicModel string) bool {
 					continue
 				}
 			}
-			if sanitizePublicJSONInPlace(nested, publicModel) {
+			if sanitizePublicJSONValueInPlace(nested, publicModel, streamState) {
 				changed = true
 			}
 		}
@@ -307,7 +393,7 @@ func sanitizePublicJSONInPlace(value any, publicModel string) bool {
 	case []any:
 		changed := false
 		for _, nested := range typed {
-			if sanitizePublicJSONInPlace(nested, publicModel) {
+			if sanitizePublicJSONValueInPlace(nested, publicModel, streamState) {
 				changed = true
 			}
 		}
@@ -315,4 +401,41 @@ func sanitizePublicJSONInPlace(value any, publicModel string) bool {
 	default:
 		return false
 	}
+}
+
+func payloadHasVisiblePublicContent(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, nested := range typed {
+			lowerKey := strings.ToLower(key)
+			switch lowerKey {
+			case "content", "text":
+				if current, ok := nested.(string); ok && strings.TrimSpace(current) != "" {
+					return true
+				}
+			case "finish_reason":
+				switch v := nested.(type) {
+				case string:
+					if strings.TrimSpace(v) != "" {
+						return true
+					}
+				case nil:
+				default:
+					return true
+				}
+			case "tool_calls", "function_call", "error":
+				return true
+			}
+			if payloadHasVisiblePublicContent(nested) {
+				return true
+			}
+		}
+	case []any:
+		for _, nested := range typed {
+			if payloadHasVisiblePublicContent(nested) {
+				return true
+			}
+		}
+	}
+	return false
 }

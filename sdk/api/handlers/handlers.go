@@ -799,7 +799,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 			// Pump bytes/errors. forwardStreamAttempt returns true when
 			// any payload was forwarded — at that point we are committed
 			// and cannot fall back regardless of subsequent errors.
-			committed, errMsg := forwardStreamAttempt(ctx, subData, subErr, dataChan, errChan, headers, subHeaders, modelName)
+			committed, errMsg := forwardStreamAttempt(ctx, subData, subErr, dataChan, errChan, headers, subHeaders, newPublicStreamSanitizer(modelName))
 			if committed {
 				return
 			}
@@ -831,10 +831,15 @@ func sanitizePublicStream(data <-chan []byte, publicModel string) <-chan []byte 
 		return data
 	}
 	out := make(chan []byte)
+	sanitizer := newPublicStreamSanitizer(publicModel)
 	go func() {
 		defer close(out)
 		for chunk := range data {
-			out <- SanitizePublicResponse(chunk, publicModel)
+			safe := sanitizePublicResponseWithState(chunk, publicModel, sanitizer)
+			if len(safe) == 0 {
+				continue
+			}
+			out <- safe
 		}
 	}()
 	return out
@@ -858,7 +863,7 @@ func forwardStreamAttempt(
 	errChan chan<- *interfaces.ErrorMessage,
 	headers http.Header,
 	subHeaders http.Header,
-	publicModel string,
+	sanitizer *publicStreamSanitizer,
 ) (bool, *interfaces.ErrorMessage) {
 	// Adopt the underlying stream's headers up-front so combo entries
 	// that share a header set still surface the right Content-Type etc.
@@ -876,8 +881,12 @@ func forwardStreamAttempt(
 				subData = nil
 				continue
 			}
+			safe := sanitizePublicResponseWithState(chunk, sanitizer.publicModel, sanitizer)
+			if len(safe) == 0 {
+				continue
+			}
 			committed = true
-			if !sendStreamData(ctx, dataChan, SanitizePublicResponse(chunk, publicModel)) {
+			if !sendStreamData(ctx, dataChan, safe) {
 				return committed, nil
 			}
 		case msg, ok := <-subErr:
