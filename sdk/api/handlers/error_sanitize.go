@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"regexp"
 	"strings"
 )
 
@@ -25,6 +26,8 @@ var internalKeywords = []string{
 	"original exception",
 	"cliproxy",
 }
+
+var thinkingTagPattern = regexp.MustCompile(`(?is)<thinking>\s*.*?\s*</thinking>\s*`)
 
 func containsInternalLeak(s string) bool {
 	if s == "" {
@@ -61,6 +64,90 @@ func sanitizeErrorText(errText string, status int) string {
 // request logger/error metadata before this body is sent to the customer.
 func sanitizeUpstreamErrorJSON(body []byte, status int) []byte {
 	return buildFallbackErrorJSON(status)
+}
+
+func looksLikeSSEChunk(body []byte) bool {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return false
+	}
+	return bytes.HasPrefix(trimmed, []byte("data:")) ||
+		bytes.HasPrefix(trimmed, []byte("event:")) ||
+		bytes.HasPrefix(trimmed, []byte(":")) ||
+		bytes.Contains(trimmed, []byte("\ndata:")) ||
+		bytes.Contains(trimmed, []byte("\nevent:")) ||
+		bytes.Contains(trimmed, []byte("\n:"))
+}
+
+func stripThinkingTags(text string) (string, bool) {
+	if text == "" {
+		return text, false
+	}
+	lower := strings.ToLower(text)
+	if !strings.Contains(lower, "<thinking>") || !strings.Contains(lower, "</thinking>") {
+		return text, false
+	}
+	cleaned := thinkingTagPattern.ReplaceAllString(text, "")
+	cleaned = strings.TrimSpace(cleaned)
+	return cleaned, cleaned != text
+}
+
+func sanitizePublicSSEChunk(chunk []byte, publicModel string) []byte {
+	lines := strings.Split(string(chunk), "\n")
+	var result strings.Builder
+	modified := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimRight(line, "\r")
+		switch {
+		case strings.HasPrefix(trimmed, ":"):
+			if strings.TrimSpace(strings.TrimPrefix(trimmed, ":")) != "" {
+				result.WriteString(": keep-alive\n")
+				modified = true
+				continue
+			}
+		case strings.HasPrefix(trimmed, "data:"):
+			data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+			if data == "" || data == "[DONE]" {
+				result.WriteString(line)
+				result.WriteString("\n")
+				continue
+			}
+			if json.Valid([]byte(data)) {
+				var payload any
+				if err := json.Unmarshal([]byte(data), &payload); err == nil {
+					if sanitizePublicJSONInPlace(payload, publicModel) {
+						rewritten, err := json.Marshal(payload)
+						if err == nil {
+							result.WriteString("data: ")
+							result.Write(rewritten)
+							result.WriteString("\n")
+							modified = true
+							continue
+						}
+					}
+				}
+			} else if cleaned, changed := stripThinkingTags(data); changed {
+				result.WriteString("data: ")
+				result.WriteString(cleaned)
+				result.WriteString("\n")
+				modified = true
+				continue
+			}
+		}
+
+		result.WriteString(line)
+		result.WriteString("\n")
+	}
+
+	if !modified {
+		return chunk
+	}
+	out := result.String()
+	if len(out) > 0 && out[len(out)-1] == '\n' && (len(chunk) == 0 || chunk[len(chunk)-1] != '\n') {
+		out = out[:len(out)-1]
+	}
+	return []byte(out)
 }
 
 // sanitizeJSONValueInPlace walks the parsed JSON value and replaces leaky
@@ -148,7 +235,14 @@ func SanitizePublicResponse(body []byte, publicModel string) []byte {
 	if len(body) == 0 {
 		return body
 	}
-	if !bytes.Contains(body, []byte(`"model"`)) && !bytes.Contains(body, []byte(`"reasoning_content"`)) && !bytes.Contains(body, []byte(`"error"`)) {
+	if looksLikeSSEChunk(body) {
+		return sanitizePublicSSEChunk(body, publicModel)
+	}
+	if !bytes.Contains(body, []byte(`"model"`)) &&
+		!bytes.Contains(body, []byte(`"reasoning_content"`)) &&
+		!bytes.Contains(body, []byte(`"encrypted_content"`)) &&
+		!bytes.Contains(body, []byte(`"error"`)) &&
+		!bytes.Contains(bytes.ToLower(body), []byte("<thinking>")) {
 		return body
 	}
 
@@ -184,10 +278,19 @@ func sanitizePublicJSONInPlace(value any, publicModel string) bool {
 				changed = true
 				continue
 			}
-			if lowerKey == "reasoning_content" {
+			if lowerKey == "reasoning_content" || lowerKey == "encrypted_content" {
 				delete(typed, key)
 				changed = true
 				continue
+			}
+			if (lowerKey == "content" || lowerKey == "text") && nested != nil {
+				if current, ok := nested.(string); ok {
+					if cleaned, modified := stripThinkingTags(current); modified {
+						typed[key] = cleaned
+						changed = true
+						continue
+					}
+				}
 			}
 			if lowerKey == "model" && publicModel != "" {
 				if current, ok := nested.(string); ok && current != publicModel {

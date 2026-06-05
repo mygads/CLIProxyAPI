@@ -193,3 +193,39 @@ func TestSanitizePublicResponseRewritesModelAndDropsReasoningContent(t *testing.
 		t.Fatalf("public model missing: %s", out)
 	}
 }
+
+func TestSanitizePublicResponseStripsThinkingTagsFromContent(t *testing.T) {
+	body := []byte(`{"id":"x","object":"chat.completion","model":"kr/claude-haiku-4.5-thinking-agentic","choices":[{"message":{"role":"assistant","content":"<thinking>\ninternal reasoning\n</thinking>\n\nok"}}]}`)
+	out := SanitizePublicResponse(body, "genfity/claude-haiku-4.5")
+
+	text := string(out)
+	if strings.Contains(strings.ToLower(text), "<thinking>") || strings.Contains(text, "internal reasoning") {
+		t.Fatalf("thinking leak remained: %s", out)
+	}
+	if !strings.Contains(text, `"content":"ok"`) {
+		t.Fatalf("sanitized content missing: %s", out)
+	}
+	if !strings.Contains(text, "genfity/claude-haiku-4.5") {
+		t.Fatalf("public model missing: %s", out)
+	}
+}
+
+func TestSanitizePublicResponse_RewritesSSEChunkAndMasksProviderPrelude(t *testing.T) {
+	body := []byte(": genflowaistreamopen\n" +
+		"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"genflowai/claude-opus-4.8-thinking-agentic\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"The\",\"content\":\"<thinking>internal reasoning</thinking>ok\"},\"finish_reason\":null}]}\n\n")
+	out := SanitizePublicResponse(body, "genfity/claude-opus-4.8")
+
+	text := string(out)
+	if strings.Contains(text, "genflowai/claude-opus-4.8-thinking-agentic") || strings.Contains(text, "reasoning_content") || strings.Contains(text, "internal reasoning") {
+		t.Fatalf("internal stream detail leaked: %s", out)
+	}
+	if !strings.Contains(text, ": keep-alive") {
+		t.Fatalf("provider prelude comment was not normalized: %s", out)
+	}
+	if !strings.Contains(text, "genfity/claude-opus-4.8") {
+		t.Fatalf("public model missing from stream chunk: %s", out)
+	}
+	if !strings.Contains(text, `"content":"ok"`) {
+		t.Fatalf("sanitized stream content missing: %s", out)
+	}
+}
