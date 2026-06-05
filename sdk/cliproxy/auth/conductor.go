@@ -26,6 +26,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 // ProviderExecutor defines the contract required by Manager to execute provider calls.
@@ -823,6 +824,195 @@ func streamErrorResult(headers http.Header, err error) *cliproxyexecutor.StreamR
 	}
 }
 
+type payloadSemanticState struct {
+	Substantive bool
+	Error       *Error
+}
+
+func inspectPayloadSemanticState(payload []byte) payloadSemanticState {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		return payloadSemanticState{}
+	}
+	if json.Valid(trimmed) {
+		return inspectJSONPayloadSemanticState(trimmed)
+	}
+
+	var state payloadSemanticState
+	sawDataLine := false
+	sawNonSSEContent := false
+	for _, line := range bytes.Split(trimmed, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		switch {
+		case bytes.HasPrefix(line, []byte("data:")):
+			sawDataLine = true
+		case bytes.HasPrefix(line, []byte(":")),
+			bytes.HasPrefix(line, []byte("event:")),
+			bytes.HasPrefix(line, []byte("id:")),
+			bytes.HasPrefix(line, []byte("retry:")):
+			continue
+		default:
+			sawNonSSEContent = true
+			continue
+		}
+		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+			continue
+		}
+		if !json.Valid(data) {
+			state.Substantive = true
+			continue
+		}
+		next := inspectJSONPayloadSemanticState(data)
+		if next.Error != nil {
+			return next
+		}
+		if next.Substantive {
+			state.Substantive = true
+		}
+	}
+	if !sawDataLine && sawNonSSEContent {
+		state.Substantive = true
+	}
+	return state
+}
+
+func inspectJSONPayloadSemanticState(payload []byte) payloadSemanticState {
+	errPayload := semanticPayloadErrorFromJSON(payload)
+	if errPayload != nil {
+		return payloadSemanticState{Error: errPayload}
+	}
+	return payloadSemanticState{Substantive: hasSubstantiveJSONPayload(payload)}
+}
+
+func semanticPayloadErrorFromJSON(payload []byte) *Error {
+	errNode := gjson.GetBytes(payload, "error")
+	if !errNode.Exists() {
+		return nil
+	}
+	code := strings.TrimSpace(errNode.Get("code").String())
+	errType := strings.TrimSpace(errNode.Get("type").String())
+	message := strings.TrimSpace(errNode.Get("message").String())
+	if message == "" {
+		message = strings.TrimSpace(errNode.Raw)
+	}
+	if message == "" {
+		message = "upstream error payload"
+	}
+	return &Error{
+		Code:       firstNonEmpty(code, errType, "upstream_error"),
+		Message:    message,
+		HTTPStatus: semanticPayloadHTTPStatus(code, errType, message),
+	}
+}
+
+func semanticPayloadHTTPStatus(code, errType, message string) int {
+	lower := strings.ToLower(strings.TrimSpace(firstNonEmpty(code, errType, message)))
+	switch {
+	case lower == "":
+		return http.StatusBadGateway
+	case strings.Contains(lower, "rate_limit"), strings.Contains(lower, "quota"), strings.Contains(lower, "cooldown"):
+		return http.StatusTooManyRequests
+	case strings.Contains(lower, "unauthorized"), strings.Contains(lower, "invalid_api_key"), strings.Contains(lower, "auth_error"), strings.Contains(lower, "authentication"):
+		return http.StatusUnauthorized
+	case strings.Contains(lower, "payment_required"), strings.Contains(lower, "insufficient_quota"):
+		return http.StatusPaymentRequired
+	case strings.Contains(lower, "model_not_supported"),
+		strings.Contains(lower, "model_not_allowed"),
+		strings.Contains(lower, "model unavailable"),
+		strings.Contains(lower, "unsupported model"),
+		strings.Contains(lower, "not available in current public model catalog"),
+		strings.Contains(lower, "not available for your plan"),
+		strings.Contains(lower, "not available for your account"):
+		return http.StatusBadRequest
+	case strings.Contains(lower, "invalid_request"), strings.Contains(lower, "invalid_argument"), strings.Contains(lower, "failed_precondition"):
+		return http.StatusBadRequest
+	default:
+		return http.StatusBadGateway
+	}
+}
+
+func hasSubstantiveJSONPayload(payload []byte) bool {
+	parsed := gjson.ParseBytes(payload)
+	if jsonValueHasSubstantiveContent(parsed.Get("message")) ||
+		jsonValueHasSubstantiveContent(parsed.Get("content")) ||
+		jsonValueHasSubstantiveContent(parsed.Get("delta")) ||
+		jsonValueHasSubstantiveContent(parsed.Get("response")) ||
+		jsonValueHasSubstantiveContent(parsed.Get("output")) ||
+		jsonValueHasSubstantiveContent(parsed.Get("content_block")) {
+		return true
+	}
+
+	choices := parsed.Get("choices")
+	if choices.Exists() && choices.IsArray() {
+		substantive := false
+		choices.ForEach(func(_, choice gjson.Result) bool {
+			if jsonValueHasSubstantiveContent(choice.Get("delta")) || jsonValueHasSubstantiveContent(choice.Get("message")) {
+				substantive = true
+				return false
+			}
+			return true
+		})
+		if substantive {
+			return true
+		}
+	}
+
+	return false
+}
+
+func jsonValueHasSubstantiveContent(value gjson.Result) bool {
+	if !value.Exists() {
+		return false
+	}
+	if value.IsArray() {
+		substantive := false
+		value.ForEach(func(_, child gjson.Result) bool {
+			if jsonValueHasSubstantiveContent(child) {
+				substantive = true
+				return false
+			}
+			return true
+		})
+		return substantive
+	}
+	if value.IsObject() {
+		if text := strings.TrimSpace(value.Get("content").String()); text != "" {
+			return true
+		}
+		if text := strings.TrimSpace(value.Get("text").String()); text != "" {
+			return true
+		}
+		if text := strings.TrimSpace(value.Get("output_text").String()); text != "" {
+			return true
+		}
+		if value.Get("tool_calls").Exists() || value.Get("function_call").Exists() || value.Get("tool_use").Exists() {
+			return true
+		}
+		if jsonValueHasSubstantiveContent(value.Get("delta")) ||
+			jsonValueHasSubstantiveContent(value.Get("message")) ||
+			jsonValueHasSubstantiveContent(value.Get("content")) ||
+			jsonValueHasSubstantiveContent(value.Get("output")) ||
+			jsonValueHasSubstantiveContent(value.Get("response")) ||
+			jsonValueHasSubstantiveContent(value.Get("content_block")) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
 func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk) ([]cliproxyexecutor.StreamChunk, bool, error) {
 	if ch == nil {
 		return nil, true, nil
@@ -848,8 +1038,12 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 		if chunk.Err != nil {
 			return nil, false, chunk.Err
 		}
+		state := inspectPayloadSemanticState(chunk.Payload)
+		if state.Error != nil {
+			return nil, false, state.Error
+		}
 		buffered = append(buffered, chunk)
-		if len(chunk.Payload) > 0 {
+		if state.Substantive {
 			return buffered, false, nil
 		}
 	}
@@ -862,6 +1056,12 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		var failed bool
 		forward := true
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
+			if !failed && chunk.Err == nil {
+				if state := inspectPayloadSemanticState(chunk.Payload); state.Error != nil {
+					failed = true
+					m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: state.Error})
+				}
+			}
 			if chunk.Err != nil && !failed {
 				failed = true
 				rerr := &Error{Message: chunk.Err.Error()}
@@ -1454,6 +1654,13 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				authErr = errExec
 				continue
 			}
+			if payloadErr := semanticPayloadErrorFromJSON(resp.Payload); payloadErr != nil {
+				result.Success = false
+				result.Error = payloadErr
+				m.MarkResult(execCtx, result)
+				authErr = payloadErr
+				continue
+			}
 			m.MarkResult(execCtx, result)
 			return resp, nil
 		}
@@ -1551,6 +1758,13 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
+				continue
+			}
+			if payloadErr := semanticPayloadErrorFromJSON(resp.Payload); payloadErr != nil {
+				result.Success = false
+				result.Error = payloadErr
+				m.MarkResult(execCtx, result)
+				authErr = payloadErr
 				continue
 			}
 			m.MarkResult(execCtx, result)
@@ -3986,6 +4200,12 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
+				m.MarkResult(creditsCtx, result)
+				continue
+			}
+			if payloadErr := semanticPayloadErrorFromJSON(resp.Payload); payloadErr != nil {
+				result.Success = false
+				result.Error = payloadErr
 				m.MarkResult(creditsCtx, result)
 				continue
 			}
