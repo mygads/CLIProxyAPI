@@ -121,6 +121,7 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 //   - c: The Gin context containing the HTTP request and response
 func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 	rawJSON, err := c.GetRawData()
+	log.Warnf("combo-debug chat-entry bytes=%d path=%q", len(rawJSON), c.Request.URL.Path)
 	// If data retrieval fails, return a 400 Bad Request error.
 	if err != nil {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
