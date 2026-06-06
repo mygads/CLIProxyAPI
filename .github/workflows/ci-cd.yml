@@ -120,8 +120,14 @@ jobs:
             # pushed image.
             echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u mygads --password-stdin
 
-            # Pull latest image and recreate the container.
-            docker compose pull cli-proxy-api
+            # Pull latest image when available. Some hosts still resolve this
+            # service as build-based or can temporarily reference a missing
+            # registry digest; in that case rebuild from the just-synced source
+            # tree instead of failing the whole deploy.
+            if ! docker compose pull cli-proxy-api; then
+              echo "docker compose pull failed; rebuilding cli-proxy-api from source"
+              docker compose build cli-proxy-api
+            fi
             docker compose up -d --force-recreate cli-proxy-api
 
             # Health check: management endpoint requires auth, but /v1/models
