@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -453,31 +452,9 @@ func (h *OpenAIAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []
 	c.Header("Content-Type", "application/json")
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
-	if strings.Contains(modelName, "genflow-fallback-20260606") {
-		attempts := h.DebugResolveModelAttemptModels(modelName)
-		c.Header("X-Combo-Debug-Has", fmt.Sprintf("%t", h != nil && h.Combos != nil && h.Combos.Has(modelName)))
-		c.Header("X-Combo-Debug-Attempts", fmt.Sprintf("%d", len(attempts)))
-		if len(attempts) > 0 {
-			c.Header("X-Combo-Debug-First", attempts[0])
-		}
-	}
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
 	if errMsg != nil {
-		if strings.Contains(modelName, "genflow-fallback-20260606") && errMsg.Addon != nil {
-			for _, key := range []string{
-				"X-Combo-Debug-Trail",
-				"X-Combo-Debug-Stop-Model",
-				"X-Combo-Debug-Stop-Status",
-				"X-Combo-Debug-Stop-Fallback",
-				"X-Combo-Debug-Stop-IsLast",
-				"X-Combo-Debug-Err",
-			} {
-				if value := errMsg.Addon.Get(key); strings.TrimSpace(value) != "" {
-					c.Header(key, value)
-				}
-			}
-		}
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return

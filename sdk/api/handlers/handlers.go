@@ -597,9 +597,6 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		return resp, hdr, nil
 	}
 
-	debugCombo := strings.Contains(modelName, "genflow-fallback-20260606")
-	var debugTrail []string
-
 	// Multi-candidate combo fallback. If the requested model is a combo,
 	// resolve the full chain and iterate until one entry succeeds or the
 	// list is exhausted. For single-model requests this collapses to the
@@ -607,32 +604,9 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	for _, attempt := range h.resolveModelAttempts(modelName) {
 		resp, headers, errMsg := h.executeSingle(ctx, handlerType, attempt.Model, rawJSON, alt)
 		if errMsg == nil {
-			if debugCombo {
-				headers = cloneHeadersOrNew(headers)
-				headers.Set("X-Combo-Debug-Trail", strings.Join(append(debugTrail, attempt.Model+"|success"), ";"))
-			}
 			return SanitizePublicResponse(resp, modelName), headers, nil
 		}
-		fallback := comboShouldFallback(errMsg, attempt.TriggerOn)
-		if debugCombo {
-			debugTrail = append(debugTrail, fmt.Sprintf("%s|status=%d|fallback=%t|last=%t", attempt.Model, errMsg.StatusCode, fallback, attempt.IsLast))
-		}
-		if attempt.IsLast || !fallback {
-			if debugCombo {
-				errMsg.Addon = cloneHeadersOrNew(errMsg.Addon)
-				errMsg.Addon.Set("X-Combo-Debug-Trail", strings.Join(debugTrail, ";"))
-				errMsg.Addon.Set("X-Combo-Debug-Stop-Model", attempt.Model)
-				errMsg.Addon.Set("X-Combo-Debug-Stop-Status", fmt.Sprintf("%d", errMsg.StatusCode))
-				errMsg.Addon.Set("X-Combo-Debug-Stop-Fallback", fmt.Sprintf("%t", fallback))
-				errMsg.Addon.Set("X-Combo-Debug-Stop-IsLast", fmt.Sprintf("%t", attempt.IsLast))
-				if errMsg.Error != nil {
-					rawErr := strings.Join(strings.Fields(errMsg.Error.Error()), " ")
-					if len(rawErr) > 240 {
-						rawErr = rawErr[:240]
-					}
-					errMsg.Addon.Set("X-Combo-Debug-Err", rawErr)
-				}
-			}
+		if attempt.IsLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
 			return nil, nil, errMsg
 		}
 		// Otherwise loop to the next candidate.
@@ -1187,26 +1161,6 @@ func statusFromError(err error) int {
 		}
 	}
 	return 0
-}
-
-func cloneHeadersOrNew(h http.Header) http.Header {
-	if h == nil {
-		return make(http.Header)
-	}
-	return h.Clone()
-}
-
-// DebugResolveModelAttemptModels exposes the resolved combo leaf order for
-// targeted runtime diagnostics without leaking the internal modelAttempt type.
-func (h *BaseAPIHandler) DebugResolveModelAttemptModels(modelName string) []string {
-	attempts := h.resolveModelAttempts(modelName)
-	out := make([]string, 0, len(attempts))
-	for _, attempt := range attempts {
-		if trimmed := strings.TrimSpace(attempt.Model); trimmed != "" {
-			out = append(out, trimmed)
-		}
-	}
-	return out
 }
 
 // modelAttempt is one step in a combo fallback chain as seen by the
