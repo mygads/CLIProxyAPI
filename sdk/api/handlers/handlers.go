@@ -23,6 +23,7 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
 
@@ -597,16 +598,32 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		return resp, hdr, nil
 	}
 
+	attempts := h.resolveModelAttempts(modelName)
+	if h != nil && h.Combos != nil && h.Combos.Has(modelName) {
+		log.Warnf("combo-debug nonstream model=%q attempts=%d leaves=%v", modelName, len(attempts), attemptModelNames(attempts))
+	}
+
 	// Multi-candidate combo fallback. If the requested model is a combo,
 	// resolve the full chain and iterate until one entry succeeds or the
 	// list is exhausted. For single-model requests this collapses to the
 	// same single-call behaviour the code had before combos existed.
-	for _, attempt := range h.resolveModelAttempts(modelName) {
+	for idx, attempt := range attempts {
 		resp, headers, errMsg := h.executeSingle(ctx, handlerType, attempt.Model, rawJSON, alt)
 		if errMsg == nil {
+			if h != nil && h.Combos != nil && h.Combos.Has(modelName) {
+				log.Warnf("combo-debug nonstream model=%q attempt=%d/%d child=%q result=success", modelName, idx+1, len(attempts), attempt.Model)
+			}
 			return SanitizePublicResponse(resp, modelName), headers, nil
 		}
-		if attempt.IsLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
+		shouldFallback := comboShouldFallback(errMsg, attempt.TriggerOn)
+		if h != nil && h.Combos != nil && h.Combos.Has(modelName) {
+			body := ""
+			if errMsg.Error != nil {
+				body = errMsg.Error.Error()
+			}
+			log.Warnf("combo-debug nonstream model=%q attempt=%d/%d child=%q status=%d fallback=%t last=%t err=%q", modelName, idx+1, len(attempts), attempt.Model, errMsg.StatusCode, shouldFallback, attempt.IsLast, body)
+		}
+		if attempt.IsLast || !shouldFallback {
 			return nil, nil, errMsg
 		}
 		// Otherwise loop to the next candidate.
@@ -766,6 +783,9 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	}
 
 	attempts := h.resolveModelAttempts(modelName)
+	if h != nil && h.Combos != nil && h.Combos.Has(modelName) {
+		log.Warnf("combo-debug stream model=%q attempts=%d leaves=%v", modelName, len(attempts), attemptModelNames(attempts))
+	}
 	// Single-candidate path skips the buffered indirection so existing
 	// non-combo behaviour stays bit-for-bit identical (header timing,
 	// keep-alives, bootstrap retries).
@@ -806,9 +826,15 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 			// and cannot fall back regardless of subsequent errors.
 			committed, errMsg := forwardStreamAttempt(ctx, subData, subErr, dataChan, errChan, headers, subHeaders, newPublicStreamSanitizer(modelName))
 			if committed {
+				if h != nil && h.Combos != nil && h.Combos.Has(modelName) {
+					log.Warnf("combo-debug stream model=%q attempt=%d/%d child=%q result=committed", modelName, i+1, len(attempts), attempt.Model)
+				}
 				return
 			}
 			if errMsg == nil {
+				if h != nil && h.Combos != nil && h.Combos.Has(modelName) {
+					log.Warnf("combo-debug stream model=%q attempt=%d/%d child=%q result=closed_without_payload", modelName, i+1, len(attempts), attempt.Model)
+				}
 				// Stream closed cleanly without forwarding any payload —
 				// treat as a soft success from the upstream's POV. The
 				// caller probably wants a 200 with empty body; the
@@ -817,7 +843,15 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 			}
 			lastErr = errMsg
 			isLast := attempt.IsLast || i == len(attempts)-1
-			if isLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
+			shouldFallback := comboShouldFallback(errMsg, attempt.TriggerOn)
+			if h != nil && h.Combos != nil && h.Combos.Has(modelName) {
+				body := ""
+				if errMsg.Error != nil {
+					body = errMsg.Error.Error()
+				}
+				log.Warnf("combo-debug stream model=%q attempt=%d/%d child=%q status=%d fallback=%t last=%t committed=%t err=%q", modelName, i+1, len(attempts), attempt.Model, errMsg.StatusCode, shouldFallback, isLast, committed, body)
+			}
+			if isLast || !shouldFallback {
 				_ = sendStreamErr(ctx, errChan, errMsg)
 				return
 			}
@@ -1170,6 +1204,14 @@ type modelAttempt struct {
 	Model     string
 	TriggerOn []string
 	IsLast    bool
+}
+
+func attemptModelNames(attempts []modelAttempt) []string {
+	out := make([]string, 0, len(attempts))
+	for _, a := range attempts {
+		out = append(out, a.Model)
+	}
+	return out
 }
 
 // resolveModelAttempts returns the ordered list of models to try for a
