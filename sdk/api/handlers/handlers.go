@@ -1163,6 +1163,19 @@ func statusFromError(err error) int {
 	return 0
 }
 
+// DebugResolveModelAttemptModels exposes the resolved combo leaf order for
+// targeted runtime diagnostics without leaking the internal modelAttempt type.
+func (h *BaseAPIHandler) DebugResolveModelAttemptModels(modelName string) []string {
+	attempts := h.resolveModelAttempts(modelName)
+	out := make([]string, 0, len(attempts))
+	for _, attempt := range attempts {
+		if trimmed := strings.TrimSpace(attempt.Model); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
 // modelAttempt is one step in a combo fallback chain as seen by the
 // Execute* methods. For non-combo requests the slice has exactly one entry
 // with IsLast=true and empty TriggerOn.
