@@ -302,6 +302,20 @@ func TestComboShouldFallback_modelNotSupportedFallsThrough(t *testing.T) {
 	}
 }
 
+func TestComboShouldFallback_providerBusy400FallsThrough(t *testing.T) {
+	bodies := []string{
+		`{"error":{"code":"invalid_request_error","message":"The requested model/provider is currently experiencing high traffic. Please try again later.","type":"invalid_request_error"}}`,
+		`{"error":{"code":"upstream_error","message":"Too many requests","type":"server_error"}}`,
+		`{"error":{"code":"invalid_request_error","message":"service temporarily unavailable","type":"invalid_request_error"}}`,
+	}
+	for _, body := range bodies {
+		msg := &interfaces.ErrorMessage{StatusCode: 400, Error: errors.New(body)}
+		if !comboShouldFallback(msg, nil) {
+			t.Errorf("expected fallback for provider-busy 400 %q; got false", body)
+		}
+	}
+}
+
 func TestComboShouldFallback_nilErrorMessage(t *testing.T) {
 	if comboShouldFallback(nil, []string{"anything"}) {
 		t.Error("nil error message must not trigger fallback")

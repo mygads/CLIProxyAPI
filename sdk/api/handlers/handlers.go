@@ -1454,6 +1454,9 @@ func comboStatusEligibleForFallback(status int, body string) bool {
 	case status >= 200 && status < 300:
 		return false
 	case status == http.StatusBadRequest:
+		if isProviderBusyBodyMessage(body) {
+			return true
+		}
 		// 400 model_not_supported = provider rejecting the model on this
 		// credential. Combo's whole point is to retry on a different
 		// credential/upstream — let the loop continue.
@@ -1482,6 +1485,29 @@ func comboStatusEligibleForFallback(status int, body string) bool {
 		// down). Combo's job is to route around them.
 		return true
 	}
+}
+
+func isProviderBusyBodyMessage(body string) bool {
+	lower := strings.ToLower(strings.TrimSpace(body))
+	if lower == "" {
+		return false
+	}
+	patterns := [...]string{
+		"rate_limit",
+		"too many requests",
+		"high traffic",
+		"cooldown",
+		"quota exceeded",
+		"insufficient_quota",
+		"temporarily unavailable",
+		"service unavailable",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 func isTransportError(body string) bool {
