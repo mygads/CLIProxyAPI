@@ -280,10 +280,12 @@ func TestComboShouldFallback_modelNotSupportedFallsThrough(t *testing.T) {
 	bodies := []string{
 		`{"error":{"code":"model_not_supported","message":"The requested model is not supported."}}`,
 		`{"error":{"code":"model_not_allowed","message":"The requested model is not allowed."}}`,
+		`{"error":{"code":"model_not_found","message":"Model 'gpt-5.4' tidak tersedia. Gunakan salah satu model dari GET /v1/models.","type":"invalid_request_error"}}`,
 		"The requested model is not supported.",
 		"The requested model is not allowed.",
 		"unsupported model: gpt-5.5",
 		"model unavailable",
+		"model not found",
 		"This model is not available for your account",
 		// Public-catalog rejection (kvc upstream, June 2026): the model was
 		// removed from the served catalog. The 400 carries an
