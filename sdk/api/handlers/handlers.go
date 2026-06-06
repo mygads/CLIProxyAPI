@@ -625,6 +625,13 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 				errMsg.Addon.Set("X-Combo-Debug-Stop-Status", fmt.Sprintf("%d", errMsg.StatusCode))
 				errMsg.Addon.Set("X-Combo-Debug-Stop-Fallback", fmt.Sprintf("%t", fallback))
 				errMsg.Addon.Set("X-Combo-Debug-Stop-IsLast", fmt.Sprintf("%t", attempt.IsLast))
+				if errMsg.Error != nil {
+					rawErr := strings.Join(strings.Fields(errMsg.Error.Error()), " ")
+					if len(rawErr) > 240 {
+						rawErr = rawErr[:240]
+					}
+					errMsg.Addon.Set("X-Combo-Debug-Err", rawErr)
+				}
 			}
 			return nil, nil, errMsg
 		}

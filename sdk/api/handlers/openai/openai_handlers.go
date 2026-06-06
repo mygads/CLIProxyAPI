@@ -471,6 +471,7 @@ func (h *OpenAIAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []
 				"X-Combo-Debug-Stop-Status",
 				"X-Combo-Debug-Stop-Fallback",
 				"X-Combo-Debug-Stop-IsLast",
+				"X-Combo-Debug-Err",
 			} {
 				if value := errMsg.Addon.Get(key); strings.TrimSpace(value) != "" {
 					c.Header(key, value)
