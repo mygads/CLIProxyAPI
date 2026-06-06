@@ -464,6 +464,19 @@ func (h *OpenAIAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
 	if errMsg != nil {
+		if strings.Contains(modelName, "genflow-fallback-20260606") && errMsg.Addon != nil {
+			for _, key := range []string{
+				"X-Combo-Debug-Trail",
+				"X-Combo-Debug-Stop-Model",
+				"X-Combo-Debug-Stop-Status",
+				"X-Combo-Debug-Stop-Fallback",
+				"X-Combo-Debug-Stop-IsLast",
+			} {
+				if value := errMsg.Addon.Get(key); strings.TrimSpace(value) != "" {
+					c.Header(key, value)
+				}
+			}
+		}
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
