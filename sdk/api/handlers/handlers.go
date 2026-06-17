@@ -604,6 +604,9 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	for _, attempt := range h.resolveModelAttempts(modelName) {
 		resp, headers, errMsg := h.executeSingle(ctx, handlerType, attempt.Model, rawJSON, alt)
 		if errMsg == nil {
+			if !attempt.IsLast && shouldFallbackMalformedToolCallResponse(rawJSON, resp) {
+				continue
+			}
 			return SanitizePublicResponse(resp, modelName), headers, nil
 		}
 		if attempt.IsLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
