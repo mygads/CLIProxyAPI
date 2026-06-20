@@ -99,12 +99,45 @@ func stripThinkingTags(text string) (string, bool) {
 	lower := strings.ToLower(text)
 	hasOpen := strings.Contains(lower, "<thinking>") || strings.Contains(lower, "<think>")
 	hasClose := strings.Contains(lower, "</thinking>") || strings.Contains(lower, "</think>")
-	if !hasOpen || !hasClose {
+	if !hasOpen {
 		return text, false
 	}
-	cleaned := thinkingTagPattern.ReplaceAllString(text, "")
-	cleaned = strings.TrimSpace(cleaned)
-	return cleaned, cleaned != text
+	if hasClose {
+		cleaned := thinkingTagPattern.ReplaceAllString(text, "")
+		cleaned = strings.TrimSpace(cleaned)
+		return cleaned, cleaned != text
+	}
+	// Open tag with NO matching close: some reasoning models (MiniMax-M*)
+	// emit "<think>…reasoning…\n\n<answer>" and forget to close the tag, so
+	// the regex above can't match. The raw reasoning — sometimes in Chinese —
+	// would otherwise leak. Treat the first blank line as the reasoning/answer
+	// boundary and drop everything up to it (including the stray open tag).
+	if cleaned, ok := stripUnclosedThink(text); ok {
+		return cleaned, true
+	}
+	return text, false
+}
+
+// stripUnclosedThink removes a leading, unclosed <think>/<thinking> block.
+// Reasoning models separate chain-of-thought from the answer with a blank
+// line, so everything from the open tag to the first "\n\n" is treated as
+// reasoning and dropped. Returns (text, false) when there is no leading open
+// tag or no blank-line boundary (can't safely separate — leave untouched).
+func stripUnclosedThink(text string) (string, bool) {
+	trimmed := strings.TrimLeft(text, " \t\r\n")
+	lower := strings.ToLower(trimmed)
+	if !strings.HasPrefix(lower, "<think>") && !strings.HasPrefix(lower, "<thinking>") {
+		return text, false
+	}
+	idx := strings.Index(trimmed, "\n\n")
+	if idx < 0 {
+		return text, false
+	}
+	answer := strings.TrimSpace(trimmed[idx+2:])
+	if answer == "" {
+		return text, false
+	}
+	return answer, true
 }
 
 func (s *publicStreamSanitizer) stripThinkingStreamText(text string) (string, bool) {
@@ -176,6 +209,30 @@ func sanitizePublicSSEChunkWithState(chunk []byte, publicModel string, streamSta
 			if strings.TrimSpace(strings.TrimPrefix(trimmed, ":")) != "" {
 				modified = true
 				continue
+			}
+		case strings.HasPrefix(strings.TrimSpace(trimmed), "{"):
+			// Some upstreams return a NON-streaming JSON body but append a
+			// stray "data: [DONE]" trailer, which makes looksLikeSSEChunk
+			// route the whole thing here. The bare-JSON line must still be
+			// sanitized (model-field rewrite + <think> strip) instead of
+			// passing through verbatim — otherwise the disguise and any
+			// Chinese chain-of-thought leak. Process it as a full JSON body.
+			jsonLine := strings.TrimSpace(trimmed)
+			if json.Valid([]byte(jsonLine)) {
+				var payload any
+				if err := json.Unmarshal([]byte(jsonLine), &payload); err == nil {
+					// Pass nil streamState: this is a COMPLETE JSON body (the
+					// content string is whole), so use the full-text think
+					// stripper which also handles an unclosed leading <think>.
+					if sanitizePublicJSONValueInPlace(payload, publicModel, nil) {
+						if rewritten, err := json.Marshal(payload); err == nil {
+							result.Write(rewritten)
+							result.WriteString("\n")
+							modified = true
+							continue
+						}
+					}
+				}
 			}
 		case strings.HasPrefix(trimmed, "data:"):
 			data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))

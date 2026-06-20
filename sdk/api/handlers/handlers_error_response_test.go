@@ -297,3 +297,42 @@ func TestSanitizePublicStream_StripsShortThinkTagAcrossChunks(t *testing.T) {
 		t.Fatalf("expected sanitized visible content, got %s", joined)
 	}
 }
+
+// Some upstreams (MiniMax via server2) return a NON-streaming JSON body with a
+// stray trailing "data: [DONE]" line. That trips looksLikeSSEChunk, so the body
+// is routed to the SSE handler — where the bare-JSON first line previously
+// passed through verbatim, leaking both the real upstream model and a Chinese
+// <think> block. Both must be sanitized.
+func TestSanitizePublicResponse_BareJSONWithStrayDoneTrailer(t *testing.T) {
+	body := []byte(`{"id":"x","choices":[{"finish_reason":"stop","index":0,"message":{"role":"assistant","content":"<think>用户在问中文\n</think>\n\nIndeks database adalah struktur data."}}],"model":"MiniMax-M3"}` + "\n" + `data: [DONE]` + "\n")
+	out := SanitizePublicResponse(body, "genfity/minimax-m3")
+
+	text := string(out)
+	if strings.Contains(text, "MiniMax-M3") {
+		t.Fatalf("upstream model leaked through hybrid body: %s", out)
+	}
+	if strings.Contains(strings.ToLower(text), "<think>") || strings.Contains(text, "用户在问中文") {
+		t.Fatalf("chinese think block leaked through hybrid body: %s", out)
+	}
+	if !strings.Contains(text, "genfity/minimax-m3") {
+		t.Fatalf("public model missing: %s", out)
+	}
+	if !strings.Contains(text, "Indeks database adalah struktur data.") {
+		t.Fatalf("visible content lost: %s", out)
+	}
+}
+
+// MiniMax sometimes emits "<think>…reasoning…\n\n answer" WITHOUT a closing
+// </think>. The full-text stripper must still drop the unclosed reasoning.
+func TestSanitizePublicResponse_UnclosedThinkBlock(t *testing.T) {
+	body := []byte(`{"id":"x","model":"server2/minimax-m3","choices":[{"message":{"role":"assistant","content":"<think>The user wants Indonesian. 查询 will be fast.\n\nIndeks database adalah struktur data tambahan."}}]}`)
+	out := SanitizePublicResponse(body, "genfity/minimax-m3")
+
+	text := string(out)
+	if strings.Contains(strings.ToLower(text), "<think>") || strings.Contains(text, "查询") {
+		t.Fatalf("unclosed think block / chinese leaked: %s", out)
+	}
+	if !strings.Contains(text, "Indeks database adalah struktur data tambahan.") {
+		t.Fatalf("visible content lost: %s", out)
+	}
+}
