@@ -597,6 +597,12 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		return resp, hdr, nil
 	}
 
+	// Language-guard injection: for Western-branded combos (claude/gpt/gemini
+	// display name) that fall back across Chinese upstreams, append an
+	// output-language directive so those upstreams don't leak Chinese into a
+	// reply the customer expects to read as Claude/GPT/Gemini.
+	rawJSON = h.injectComboLanguageGuard(handlerType, modelName, rawJSON)
+
 	// Multi-candidate combo fallback. If the requested model is a combo,
 	// resolve the full chain and iterate until one entry succeeds or the
 	// list is exhausted. For single-model requests this collapses to the
@@ -767,6 +773,8 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return dataChan, hdr, errChan
 	}
+
+	rawJSON = h.injectComboLanguageGuard(handlerType, modelName, rawJSON)
 
 	attempts := h.resolveModelAttempts(modelName)
 	// Single-candidate path skips the buffered indirection so existing
@@ -1266,6 +1274,23 @@ func (h *BaseAPIHandler) flattenComboAttempts(modelName string, seen map[string]
 		out = append(out, modelAttempt{Model: c.Model, TriggerOn: c.TriggerOn})
 	}
 	return out
+}
+
+// injectComboLanguageGuard appends an output-language directive to the system
+// prompt when modelName is a Western-branded combo (claude/gpt/gemini display
+// name). This steers the combo's Chinese fallback upstreams (Qwen/GLM/Kimi/
+// MiniMax/MiMo/DeepSeek) away from emitting Chinese into a reply the customer
+// expects to read as the published brand. No-op for non-combo models, combos
+// with no display name, and Chinese-branded combos. Idempotent.
+func (h *BaseAPIHandler) injectComboLanguageGuard(handlerType, modelName string, rawJSON []byte) []byte {
+	if h == nil || h.Combos == nil {
+		return rawJSON
+	}
+	displayName := h.Combos.DisplayName(modelName)
+	if displayName == "" {
+		return rawJSON
+	}
+	return combo.InjectLanguageGuard(handlerType, rawJSON, displayName)
 }
 
 // tryComboIdentityIntercept checks whether the request is an identity
