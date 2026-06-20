@@ -261,3 +261,39 @@ func TestSanitizePublicStream_StripsThinkingAcrossChunks(t *testing.T) {
 		t.Fatalf("expected sanitized visible stream payload, got %s", joined)
 	}
 }
+
+// MiniMax-M* / MiMo emit <think>…</think> (no "-ing"). Chinese chain-of-thought
+// was leaking into the content field through the short spelling.
+func TestSanitizePublicResponseStripsShortThinkTagFromContent(t *testing.T) {
+	body := []byte(`{"id":"x","object":"chat.completion","model":"server2/minimax-m3","choices":[{"message":{"role":"assistant","content":"<think>\n用户想要解释\n</think>\n\nIndeks database adalah struktur data."}}]}`)
+	out := SanitizePublicResponse(body, "genfity/minimax-m3")
+
+	text := string(out)
+	if strings.Contains(strings.ToLower(text), "<think>") || strings.Contains(text, "用户想要解释") {
+		t.Fatalf("short think tag / chinese reasoning leaked: %s", out)
+	}
+	if !strings.Contains(text, "Indeks database adalah struktur data.") {
+		t.Fatalf("visible content lost: %s", out)
+	}
+}
+
+func TestSanitizePublicStream_StripsShortThinkTagAcrossChunks(t *testing.T) {
+	in := make(chan []byte, 5)
+	in <- []byte("data: {\"choices\":[{\"delta\":{\"content\":\"<think>用户\"},\"index\":0}],\"model\":\"server2/minimax-m3\",\"object\":\"chat.completion.chunk\"}\n\n")
+	in <- []byte("data: {\"choices\":[{\"delta\":{\"content\":\"想要解释\"},\"index\":0}],\"model\":\"server2/minimax-m3\",\"object\":\"chat.completion.chunk\"}\n\n")
+	in <- []byte("data: {\"choices\":[{\"delta\":{\"content\":\"</think>ok\"},\"index\":0}],\"model\":\"server2/minimax-m3\",\"object\":\"chat.completion.chunk\"}\n\n")
+	in <- []byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"model\":\"server2/minimax-m3\",\"object\":\"chat.completion.chunk\"}\n\n")
+	close(in)
+
+	var chunks []string
+	for chunk := range sanitizePublicStream(in, "genfity/minimax-m3") {
+		chunks = append(chunks, string(chunk))
+	}
+	joined := strings.Join(chunks, "")
+	if strings.Contains(strings.ToLower(joined), "<think>") || strings.Contains(joined, "用户") || strings.Contains(joined, "想要解释") {
+		t.Fatalf("short think tag / chinese leaked across chunks: %s", joined)
+	}
+	if !strings.Contains(joined, "\"content\":\"ok\"") {
+		t.Fatalf("expected sanitized visible content, got %s", joined)
+	}
+}

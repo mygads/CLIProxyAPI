@@ -27,7 +27,11 @@ var internalKeywords = []string{
 	"cliproxy",
 }
 
-var thinkingTagPattern = regexp.MustCompile(`(?is)<thinking>\s*.*?\s*</thinking>\s*`)
+// thinkingTagPattern matches a complete reasoning block in the content field.
+// Upstreams disagree on the tag spelling: most use <thinking>…</thinking>, but
+// some reasoning models (MiniMax-M*, MiMo) emit <think>…</think>. Match both so
+// raw chain-of-thought — which may be in Chinese — never reaches the customer.
+var thinkingTagPattern = regexp.MustCompile(`(?is)<think(?:ing)?>\s*.*?\s*</think(?:ing)?>\s*`)
 
 type publicStreamSanitizer struct {
 	publicModel    string
@@ -93,7 +97,9 @@ func stripThinkingTags(text string) (string, bool) {
 		return text, false
 	}
 	lower := strings.ToLower(text)
-	if !strings.Contains(lower, "<thinking>") || !strings.Contains(lower, "</thinking>") {
+	hasOpen := strings.Contains(lower, "<thinking>") || strings.Contains(lower, "<think>")
+	hasClose := strings.Contains(lower, "</thinking>") || strings.Contains(lower, "</think>")
+	if !hasOpen || !hasClose {
 		return text, false
 	}
 	cleaned := thinkingTagPattern.ReplaceAllString(text, "")
@@ -113,31 +119,45 @@ func (s *publicStreamSanitizer) stripThinkingStreamText(text string) (string, bo
 	for len(remaining) > 0 {
 		lower := strings.ToLower(remaining)
 		if s.insideThinking {
-			end := strings.Index(lower, "</thinking>")
+			end, endLen := firstTagIndex(lower, "</thinking>", "</think>")
 			if end < 0 {
 				changed = true
 				remaining = ""
 				break
 			}
-			remaining = remaining[end+len("</thinking>"):]
+			remaining = remaining[end+endLen:]
 			s.insideThinking = false
 			changed = true
 			continue
 		}
 
-		start := strings.Index(lower, "<thinking>")
+		start, startLen := firstTagIndex(lower, "<thinking>", "<think>")
 		if start < 0 {
 			out.WriteString(remaining)
 			break
 		}
 		out.WriteString(remaining[:start])
-		remaining = remaining[start+len("<thinking>"):]
+		remaining = remaining[start+startLen:]
 		s.insideThinking = true
 		changed = true
 	}
 
 	cleaned := out.String()
 	return cleaned, changed || cleaned != original
+}
+
+// firstTagIndex returns the earliest index at which any of the given tag
+// spellings appears in lower, along with the matched tag's length. Returns
+// (-1, 0) when none are present. Used so the stream sanitizer accepts both
+// <thinking> and the shorter <think> (MiniMax/MiMo) spellings.
+func firstTagIndex(lower string, tags ...string) (int, int) {
+	best, bestLen := -1, 0
+	for _, t := range tags {
+		if idx := strings.Index(lower, t); idx >= 0 && (best < 0 || idx < best) {
+			best, bestLen = idx, len(t)
+		}
+	}
+	return best, bestLen
 }
 
 func sanitizePublicSSEChunk(chunk []byte, publicModel string) []byte {
@@ -315,7 +335,7 @@ func sanitizePublicResponseWithState(body []byte, publicModel string, streamStat
 		!bytes.Contains(body, []byte(`"reasoning_content"`)) &&
 		!bytes.Contains(body, []byte(`"encrypted_content"`)) &&
 		!bytes.Contains(body, []byte(`"error"`)) &&
-		!bytes.Contains(bytes.ToLower(body), []byte("<thinking>")) {
+		!bytes.Contains(bytes.ToLower(body), []byte("<think")) {
 		return body
 	}
 
