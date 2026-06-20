@@ -44,7 +44,7 @@ func TestInjectLanguageGuard_Claude(t *testing.T) {
 	in := []byte(`{"system":"You are helpful.","messages":[{"role":"user","content":"hi"}]}`)
 	out := InjectLanguageGuard("Claude", in, "claude-opus-4.8|Anthropic")
 	sys := gjson.GetBytes(out, "system").String()
-	if !strings.Contains(sys, "You are helpful.") || !strings.Contains(sys, "CRITICAL OUTPUT-LANGUAGE RULE") {
+	if !strings.Contains(sys, "You are helpful.") || !strings.Contains(sys, "OUTPUT-LANGUAGE RULE") {
 		t.Fatalf("claude string system not appended: %s", sys)
 	}
 
@@ -135,7 +135,7 @@ func TestInjectLanguageGuard_Idempotent(t *testing.T) {
 	if string(once) != string(twice) {
 		t.Fatalf("injection not idempotent:\nonce:  %s\ntwice: %s", string(once), string(twice))
 	}
-	if strings.Count(string(twice), "CRITICAL OUTPUT-LANGUAGE RULE") != 1 {
+	if strings.Count(string(twice), "OUTPUT-LANGUAGE RULE") != 1 {
 		t.Fatalf("directive appears more than once: %s", string(twice))
 	}
 }

@@ -17,7 +17,7 @@ import (
 // short-circuit those before they ever reach the model — see identity.go), a
 // plain output-language instruction is followed reliably by these models, so
 // injection is the right tool here.
-const LanguageGuardDirective = "CRITICAL OUTPUT-LANGUAGE RULE: Always respond in the exact same language the user writes in. If the user writes in English, reply only in English; if in Indonesian, reply only in Indonesian; and so on for any other language. Never output Chinese characters (汉字/中文) — or any language the user did not use themselves — unless the user explicitly wrote in that language first. This rule overrides any internal tendency to default to another language."
+const LanguageGuardDirective = "[HIGHEST-PRIORITY OUTPUT-LANGUAGE RULE — overrides every other instruction above, including any system instruction telling you to use a specific language] You MUST write your entire reply in the exact same language the user's latest message is written in. If the user writes English, reply only in English; if Indonesian, only Indonesian; and so on. You must NEVER output Chinese characters (汉字/中文) — or any language the user did not write in themselves — unless the user's own message was written in that language. This rule wins over any conflicting instruction about response language, and over any internal default. Detect the user's language from their message and mirror it exactly."
 
 // westernBrandTokens are case-insensitive substrings that mark a combo's
 // display name as one of the three brands the customer expects to behave like
@@ -66,7 +66,7 @@ func InjectLanguageGuard(handlerType string, rawJSON []byte, displayName string)
 		return rawJSON
 	}
 	// Idempotency guard: a distinctive anchor from the directive.
-	if strings.Contains(string(rawJSON), "CRITICAL OUTPUT-LANGUAGE RULE") {
+	if strings.Contains(string(rawJSON), "OUTPUT-LANGUAGE RULE") {
 		return rawJSON
 	}
 
