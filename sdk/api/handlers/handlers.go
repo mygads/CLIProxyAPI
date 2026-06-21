@@ -642,6 +642,19 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 // mutates it.
 var comboAttemptTimeout = 45 * time.Second
 
+// comboStreamIdleTimeout bounds how long an ALREADY-COMMITTED stream may go
+// without receiving any byte from the upstream before it is abandoned. The
+// bootstrap watchdog (comboAttemptTimeout) only guards time-to-first-byte;
+// once the first visible chunk commits the stream it is disarmed. Without a
+// post-commit guard, an upstream that emits a few tokens and then stalls
+// mid-generation pins the request to the gateway's ~120s client timeout: the
+// downstream client RTOs and sees a hang, yet the gateway later books a 200
+// and bills it. The timer resets on every upstream byte, so a long but
+// steadily-producing generation is never cut short — only a genuine stall is.
+// It applies to every committed candidate (last or not), since the stall can
+// happen on whichever leaf won the bootstrap.
+var comboStreamIdleTimeout = 45 * time.Second
+
 // executeSingleWithAttemptTimeout runs one combo candidate. For non-last
 // candidates it bounds the call with comboAttemptTimeout so a hanging upstream
 // triggers fallback instead of stalling the request; the resulting "context
@@ -864,7 +877,9 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 			}
 			subData, subHeaders, subErr := h.executeStreamSingle(attemptCtx, handlerType, attempt.Model, rawJSON, alt)
 			// onCommit fires once, when the first visible byte is forwarded.
-			committed, errMsg := forwardStreamAttemptOnCommit(attemptCtx, subData, subErr, dataChan, errChan, headers, subHeaders, newPublicStreamSanitizer(modelName), func() { close(committedCh) })
+			// onIdleStall (=cancel) lets the post-commit idle watchdog abort a
+			// stream that committed then stalled mid-generation.
+			committed, errMsg := forwardStreamAttemptOnCommit(attemptCtx, subData, subErr, dataChan, errChan, headers, subHeaders, newPublicStreamSanitizer(modelName), func() { close(committedCh) }, cancel)
 			if committed {
 				// Live stream owns attemptCtx for its full lifetime; it shares
 				// the parent's cancellation. Do NOT cancel here.
@@ -932,7 +947,7 @@ func forwardStreamAttempt(
 	subHeaders http.Header,
 	sanitizer *publicStreamSanitizer,
 ) (bool, *interfaces.ErrorMessage) {
-	return forwardStreamAttemptOnCommit(ctx, subData, subErr, dataChan, errChan, headers, subHeaders, sanitizer, nil)
+	return forwardStreamAttemptOnCommit(ctx, subData, subErr, dataChan, errChan, headers, subHeaders, sanitizer, nil, nil)
 }
 
 // forwardStreamAttemptOnCommit is forwardStreamAttempt with an optional
@@ -950,12 +965,47 @@ func forwardStreamAttemptOnCommit(
 	subHeaders http.Header,
 	sanitizer *publicStreamSanitizer,
 	onCommit func(),
+	onIdleStall context.CancelFunc,
 ) (bool, *interfaces.ErrorMessage) {
 	// Adopt the underlying stream's headers up-front so combo entries
 	// that share a header set still surface the right Content-Type etc.
 	// We replace rather than merge — last attempt's headers win, which
 	// is the same contract the legacy single-candidate path had.
 	replaceHeader(headers, subHeaders)
+
+	// Post-commit idle watchdog. The bootstrap watchdog only guards
+	// time-to-first-byte; once committed it is disarmed. This timer guards
+	// against an upstream that commits a few tokens then stalls forever,
+	// which would otherwise pin the request to the gateway's ~120s client
+	// timeout (client RTOs, gateway still books a 200). The timer is armed
+	// on commit and reset on every upstream byte, so a steadily-producing
+	// long generation is never cut — only a genuine stall trips it.
+	var idle *time.Timer
+	idleFired := make(chan struct{})
+	armIdle := func() {
+		if onIdleStall == nil || comboStreamIdleTimeout <= 0 {
+			return
+		}
+		idle = time.NewTimer(comboStreamIdleTimeout)
+		go func() {
+			select {
+			case <-idle.C:
+				onIdleStall() // stall — cancel the attempt ctx, ending the stream
+				close(idleFired)
+			case <-ctx.Done():
+			}
+		}()
+	}
+	resetIdle := func() {
+		if idle != nil {
+			idle.Reset(comboStreamIdleTimeout)
+		}
+	}
+	defer func() {
+		if idle != nil {
+			idle.Stop()
+		}
+	}()
 
 	committed := false
 	for subData != nil || subErr != nil {
@@ -973,8 +1023,10 @@ func forwardStreamAttemptOnCommit(
 			}
 			if !committed && onCommit != nil {
 				onCommit()
+				armIdle()
 			}
 			committed = true
+			resetIdle()
 			if !sendStreamData(ctx, dataChan, safe) {
 				return committed, nil
 			}
