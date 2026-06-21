@@ -79,6 +79,28 @@ func sanitizeUpstreamErrorJSON(body []byte, status int) []byte {
 	return buildFallbackErrorJSON(status)
 }
 
+// trimTrailingSSENoise strips a trailing "data: [DONE]"/"data:"/"event:"
+// segment that some upstreams glue onto a non-streaming JSON body without a
+// preceding newline (e.g. `{...}}data: [DONE]\n\n`). Without this trim,
+// json.Unmarshal of the whole body fails and the response passes through
+// unsanitized — leaking model fields and <think> blocks.
+func trimTrailingSSENoise(body []byte) []byte {
+	trimmed := bytes.TrimRight(body, " \t\r\n")
+	for {
+		// Repeatedly peel one trailing SSE-style suffix per iteration.
+		switch {
+		case bytes.HasSuffix(trimmed, []byte("[DONE]")):
+			trimmed = bytes.TrimRight(trimmed[:len(trimmed)-len("[DONE]")], " \t\r\n")
+		case bytes.HasSuffix(trimmed, []byte("data:")), bytes.HasSuffix(trimmed, []byte("event:")):
+			trimmed = bytes.TrimRight(trimmed[:len(trimmed)-5], " \t\r\n")
+		default:
+			return trimmed
+		}
+		// Strip any "data: " or "event: " prefix that's now bare at the tail
+		// (the loop above stops at the colon; nothing else needed here).
+	}
+}
+
 func looksLikeSSEChunk(body []byte) bool {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
@@ -388,6 +410,12 @@ func sanitizePublicResponseWithState(body []byte, publicModel string, streamStat
 	if looksLikeSSEChunk(body) {
 		return sanitizePublicSSEChunkWithState(body, publicModel, streamState)
 	}
+	// Some upstreams (MiniMax via server2) return a non-streaming JSON body
+	// glued directly onto a stray "data: [DONE]" trailer (no newline). That
+	// trailer breaks json.Unmarshal so the body would otherwise pass through
+	// unsanitized — leaking the real upstream model and any <think> block.
+	// Trim trailing SSE noise before the validity gate.
+	body = trimTrailingSSENoise(body)
 	if !bytes.Contains(body, []byte(`"model"`)) &&
 		!bytes.Contains(body, []byte(`"reasoning_content"`)) &&
 		!bytes.Contains(body, []byte(`"encrypted_content"`)) &&

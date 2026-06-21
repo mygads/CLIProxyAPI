@@ -304,7 +304,10 @@ func TestSanitizePublicStream_StripsShortThinkTagAcrossChunks(t *testing.T) {
 // passed through verbatim, leaking both the real upstream model and a Chinese
 // <think> block. Both must be sanitized.
 func TestSanitizePublicResponse_BareJSONWithStrayDoneTrailer(t *testing.T) {
-	body := []byte(`{"id":"x","choices":[{"finish_reason":"stop","index":0,"message":{"role":"assistant","content":"<think>用户在问中文\n</think>\n\nIndeks database adalah struktur data."}}],"model":"MiniMax-M3"}` + "\n" + `data: [DONE]` + "\n")
+	// Real MiniMax-via-server2 framing: the "data: [DONE]" trailer is glued
+	// directly onto the closing braces with NO preceding newline, so
+	// looksLikeSSEChunk misses it and json.Unmarshal of the whole body fails.
+	body := []byte(`{"id":"x","choices":[{"finish_reason":"stop","index":0,"message":{"role":"assistant","content":"<think>用户在问中文\n</think>\n\nIndeks database adalah struktur data."}}],"model":"MiniMax-M3"}data: [DONE]` + "\n\n")
 	out := SanitizePublicResponse(body, "genfity/minimax-m3")
 
 	text := string(out)
@@ -319,6 +322,20 @@ func TestSanitizePublicResponse_BareJSONWithStrayDoneTrailer(t *testing.T) {
 	}
 	if !strings.Contains(text, "Indeks database adalah struktur data.") {
 		t.Fatalf("visible content lost: %s", out)
+	}
+}
+
+func TestTrimTrailingSSENoise(t *testing.T) {
+	cases := map[string]string{
+		`{"a":1}data: [DONE]` + "\n\n": `{"a":1}`,
+		`{"a":1}` + "\ndata: [DONE]\n": `{"a":1}`,
+		`{"a":1}data:[DONE]`:            `{"a":1}`,
+		`{"a":1}`:                       `{"a":1}`, // no trailer untouched
+	}
+	for in, want := range cases {
+		if got := string(trimTrailingSSENoise([]byte(in))); got != want {
+			t.Errorf("trimTrailingSSENoise(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
