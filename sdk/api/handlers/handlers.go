@@ -608,7 +608,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	// list is exhausted. For single-model requests this collapses to the
 	// same single-call behaviour the code had before combos existed.
 	for _, attempt := range h.resolveModelAttempts(modelName) {
-		resp, headers, errMsg := h.executeSingle(ctx, handlerType, attempt.Model, rawJSON, alt)
+		resp, headers, errMsg := h.executeSingleWithAttemptTimeout(ctx, handlerType, attempt, rawJSON, alt)
 		if errMsg == nil {
 			if !attempt.IsLast && shouldFallbackMalformedToolCallResponse(rawJSON, resp) {
 				continue
@@ -627,6 +627,34 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		StatusCode: http.StatusInternalServerError,
 		Error:      fmt.Errorf("combo fallback: no candidates produced for %q", modelName),
 	}
+}
+
+// comboAttemptTimeout caps how long a single NON-LAST combo candidate may run
+// before it is abandoned and the loop falls through to the next entry. Some
+// upstreams accept the connection but never respond (or stall mid-generation);
+// combo fallback only fires on an *error*, so without a per-attempt deadline a
+// hung head entry pins the whole request until the gateway's 120s client
+// timeout — defeating the fallback and surfacing as provider_error/500 with
+// ~125s latency. The LAST/only attempt is exempt: it keeps the full request
+// budget so a genuinely long single-model generation is not cut short.
+//
+// It is a var (not const) so tests can shrink it; production code never
+// mutates it.
+var comboAttemptTimeout = 45 * time.Second
+
+// executeSingleWithAttemptTimeout runs one combo candidate. For non-last
+// candidates it bounds the call with comboAttemptTimeout so a hanging upstream
+// triggers fallback instead of stalling the request; the resulting "context
+// deadline exceeded" error is classified as a transport error by
+// comboShouldFallback and lets the loop continue. The last attempt runs with
+// the parent context unchanged.
+func (h *BaseAPIHandler) executeSingleWithAttemptTimeout(ctx context.Context, handlerType string, attempt modelAttempt, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	if attempt.IsLast {
+		return h.executeSingle(ctx, handlerType, attempt.Model, rawJSON, alt)
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, comboAttemptTimeout)
+	defer cancel()
+	return h.executeSingle(attemptCtx, handlerType, attempt.Model, rawJSON, alt)
 }
 
 // executeSingle issues one non-streaming call using the canonical path that
@@ -811,14 +839,38 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				default:
 				}
 			}
-			subData, subHeaders, subErr := h.executeStreamSingle(ctx, handlerType, attempt.Model, rawJSON, alt)
-			// Pump bytes/errors. forwardStreamAttempt returns true when
-			// any payload was forwarded — at that point we are committed
-			// and cannot fall back regardless of subsequent errors.
-			committed, errMsg := forwardStreamAttempt(ctx, subData, subErr, dataChan, errChan, headers, subHeaders, newPublicStreamSanitizer(modelName))
+			isLast := attempt.IsLast || i == len(attempts)-1
+			// Bound the BOOTSTRAP (time-to-first-byte) of NON-LAST candidates:
+			// a hung upstream that accepts the connection but never emits a
+			// first byte would otherwise pin the stream until the gateway's
+			// 120s client timeout, defeating fallback ("agent stops
+			// mid-stream"). We use a cancellable context plus a watchdog that
+			// cancels ONLY if no byte has been forwarded within
+			// comboAttemptTimeout. Once the first byte commits the stream the
+			// watchdog is disarmed, so a long generation is never truncated.
+			attemptCtx, cancel := context.WithCancel(ctx)
+			committedCh := make(chan struct{})
+			if !isLast {
+				go func() {
+					timer := time.NewTimer(comboAttemptTimeout)
+					defer timer.Stop()
+					select {
+					case <-committedCh: // first byte forwarded — disarm
+					case <-attemptCtx.Done(): // request ended
+					case <-timer.C:
+						cancel() // bootstrap stalled — abort, trigger fallback
+					}
+				}()
+			}
+			subData, subHeaders, subErr := h.executeStreamSingle(attemptCtx, handlerType, attempt.Model, rawJSON, alt)
+			// onCommit fires once, when the first visible byte is forwarded.
+			committed, errMsg := forwardStreamAttemptOnCommit(attemptCtx, subData, subErr, dataChan, errChan, headers, subHeaders, newPublicStreamSanitizer(modelName), func() { close(committedCh) })
 			if committed {
+				// Live stream owns attemptCtx for its full lifetime; it shares
+				// the parent's cancellation. Do NOT cancel here.
 				return
 			}
+			cancel()
 			if errMsg == nil {
 				// Stream closed cleanly without forwarding any payload —
 				// treat as a soft success from the upstream's POV. The
@@ -827,7 +879,6 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				return
 			}
 			lastErr = errMsg
-			isLast := attempt.IsLast || i == len(attempts)-1
 			if isLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
 				_ = sendStreamErr(ctx, errChan, errMsg)
 				return
@@ -881,6 +932,25 @@ func forwardStreamAttempt(
 	subHeaders http.Header,
 	sanitizer *publicStreamSanitizer,
 ) (bool, *interfaces.ErrorMessage) {
+	return forwardStreamAttemptOnCommit(ctx, subData, subErr, dataChan, errChan, headers, subHeaders, sanitizer, nil)
+}
+
+// forwardStreamAttemptOnCommit is forwardStreamAttempt with an optional
+// onCommit callback invoked exactly once, the moment the first visible byte is
+// forwarded downstream. The combo stream loop uses it to disarm the bootstrap
+// watchdog so the per-attempt timeout never truncates an already-flowing
+// stream.
+func forwardStreamAttemptOnCommit(
+	ctx context.Context,
+	subData <-chan []byte,
+	subErr <-chan *interfaces.ErrorMessage,
+	dataChan chan<- []byte,
+	errChan chan<- *interfaces.ErrorMessage,
+	headers http.Header,
+	subHeaders http.Header,
+	sanitizer *publicStreamSanitizer,
+	onCommit func(),
+) (bool, *interfaces.ErrorMessage) {
 	// Adopt the underlying stream's headers up-front so combo entries
 	// that share a header set still surface the right Content-Type etc.
 	// We replace rather than merge — last attempt's headers win, which
@@ -900,6 +970,9 @@ func forwardStreamAttempt(
 			safe := sanitizePublicResponseWithState(chunk, sanitizer.publicModel, sanitizer)
 			if len(safe) == 0 || !publicChunkHasVisibleContent(safe) {
 				continue
+			}
+			if !committed && onCommit != nil {
+				onCommit()
 			}
 			committed = true
 			if !sendStreamData(ctx, dataChan, safe) {
