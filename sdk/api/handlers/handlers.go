@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -343,6 +344,13 @@ type ComboCandidate struct {
 	IsLast bool
 }
 
+// ComboMetricsRecorder is the minimal surface the handler needs to record
+// per-attempt combo outcomes. Production resolvers implement this via
+// combo.Registry; tests can supply a fake or leave it nil to disable recording.
+type ComboMetricsRecorder interface {
+	Record(comboName string, entryIndex int, success bool, latency time.Duration, triggerReason string)
+}
+
 // BaseAPIHandler contains the handlers for API endpoints.
 // It holds a pool of clients to interact with the backend service and manages
 // load balancing, client selection, and configuration.
@@ -357,6 +365,11 @@ type BaseAPIHandler struct {
 	// matches a combo name are rewritten to the combo's first candidate
 	// before provider lookup. A nil resolver disables the feature.
 	Combos ComboResolver
+
+	// ComboMetrics is optional. When set, combo attempt outcomes are
+	// recorded so operators can inspect success/failure/latency via the
+	// management metrics endpoint.
+	ComboMetrics ComboMetricsRecorder
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.
@@ -607,14 +620,21 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	// resolve the full chain and iterate until one entry succeeds or the
 	// list is exhausted. For single-model requests this collapses to the
 	// same single-call behaviour the code had before combos existed.
-	for _, attempt := range h.resolveModelAttempts(modelName) {
+	attempts := h.resolveModelAttempts(modelName)
+	isCombo := len(attempts) > 1
+	for i, attempt := range attempts {
+		start := time.Now()
 		resp, headers, errMsg := h.executeSingleWithAttemptTimeout(ctx, handlerType, attempt, rawJSON, alt)
 		if errMsg == nil {
 			if !attempt.IsLast && shouldFallbackMalformedToolCallResponse(rawJSON, resp) {
+				h.recordComboAttempt(modelName, i, isCombo, false, start, "malformed_tool_response")
 				continue
 			}
+			h.recordComboAttempt(modelName, i, isCombo, true, start, "")
 			return SanitizePublicResponse(resp, modelName), headers, nil
 		}
+		triggerReason := h.classifyFallbackReason(errMsg)
+		h.recordComboAttempt(modelName, i, isCombo, false, start, triggerReason)
 		if attempt.IsLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
 			return nil, nil, errMsg
 		}
@@ -629,7 +649,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	}
 }
 
-// comboAttemptTimeout caps how long a single NON-LAST combo candidate may run
+// defaultComboAttemptTimeout caps how long a single NON-LAST combo candidate may run
 // before it is abandoned and the loop falls through to the next entry. Some
 // upstreams accept the connection but never respond (or stall mid-generation);
 // combo fallback only fires on an *error*, so without a per-attempt deadline a
@@ -638,11 +658,13 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 // ~125s latency. The LAST/only attempt is exempt: it keeps the full request
 // budget so a genuinely long single-model generation is not cut short.
 //
-// It is a var (not const) so tests can shrink it; production code never
-// mutates it.
-var comboAttemptTimeout = 45 * time.Second
+// Production code reads the configured value from SDKConfig via the
+// comboAttemptTimeout method; this var is kept so existing tests can still
+// shrink it by assigning directly. 15s: fall through fast when a candidate
+// hangs before its first byte instead of stalling the request ~45-60s.
+var comboAttemptTimeout = 15 * time.Second
 
-// comboStreamIdleTimeout bounds how long an ALREADY-COMMITTED stream may go
+// defaultComboStreamIdleTimeout bounds how long an ALREADY-COMMITTED stream may go
 // without receiving any byte from the upstream before it is abandoned. The
 // bootstrap watchdog (comboAttemptTimeout) only guards time-to-first-byte;
 // once the first visible chunk commits the stream it is disarmed. Without a
@@ -653,7 +675,33 @@ var comboAttemptTimeout = 45 * time.Second
 // steadily-producing generation is never cut short — only a genuine stall is.
 // It applies to every committed candidate (last or not), since the stall can
 // happen on whichever leaf won the bootstrap.
-var comboStreamIdleTimeout = 45 * time.Second
+//
+// Production code reads the configured value from SDKConfig via the
+// comboStreamIdleTimeout method; this var is kept so existing tests can still
+// shrink it by assigning directly.
+var comboStreamIdleTimeout = 60 * time.Second
+
+// comboAttemptTimeout returns the configured per-attempt combo timeout.
+// Falls back to the package-level default when no config is available.
+func (h *BaseAPIHandler) comboAttemptTimeout() time.Duration {
+	if h != nil && h.Cfg != nil {
+		if d := h.Cfg.ComboAttemptTimeout(); d > 0 {
+			return d
+		}
+	}
+	return comboAttemptTimeout
+}
+
+// comboStreamIdleTimeout returns the configured post-commit idle timeout.
+// Falls back to the package-level default when no config is available.
+func (h *BaseAPIHandler) comboStreamIdleTimeout() time.Duration {
+	if h != nil && h.Cfg != nil {
+		if d := h.Cfg.ComboStreamIdleTimeout(); d > 0 {
+			return d
+		}
+	}
+	return comboStreamIdleTimeout
+}
 
 // executeSingleWithAttemptTimeout runs one combo candidate. For non-last
 // candidates it bounds the call with comboAttemptTimeout so a hanging upstream
@@ -665,7 +713,7 @@ func (h *BaseAPIHandler) executeSingleWithAttemptTimeout(ctx context.Context, ha
 	if attempt.IsLast {
 		return h.executeSingle(ctx, handlerType, attempt.Model, rawJSON, alt)
 	}
-	attemptCtx, cancel := context.WithTimeout(ctx, comboAttemptTimeout)
+	attemptCtx, cancel := context.WithTimeout(ctx, h.comboAttemptTimeout())
 	defer cancel()
 	return h.executeSingle(attemptCtx, handlerType, attempt.Model, rawJSON, alt)
 }
@@ -733,11 +781,17 @@ func (h *BaseAPIHandler) executeSingle(ctx context.Context, handlerType, modelNa
 // a combo would only ever hit the head entry and never recover when it
 // goes dead.
 func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
-	for _, attempt := range h.resolveModelAttempts(modelName) {
+	attempts := h.resolveModelAttempts(modelName)
+	isCombo := len(attempts) > 1
+	for i, attempt := range attempts {
+		start := time.Now()
 		resp, headers, errMsg := h.executeCountSingle(ctx, handlerType, attempt.Model, rawJSON, alt)
 		if errMsg == nil {
+			h.recordComboAttempt(modelName, i, isCombo, true, start, "")
 			return resp, headers, nil
 		}
+		triggerReason := h.classifyFallbackReason(errMsg)
+		h.recordComboAttempt(modelName, i, isCombo, false, start, triggerReason)
 		if attempt.IsLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
 			return nil, nil, errMsg
 		}
@@ -852,6 +906,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				default:
 				}
 			}
+			start := time.Now()
 			isLast := attempt.IsLast || i == len(attempts)-1
 			// Bound the BOOTSTRAP (time-to-first-byte) of NON-LAST candidates:
 			// a hung upstream that accepts the connection but never emits a
@@ -861,38 +916,90 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 			// cancels ONLY if no byte has been forwarded within
 			// comboAttemptTimeout. Once the first byte commits the stream the
 			// watchdog is disarmed, so a long generation is never truncated.
+			//
+			// bootstrapTimedOut / idleStalled record WHY attemptCtx was
+			// cancelled so the code after forward can tell a watchdog abort
+			// (must fall through + record failure) apart from a clean empty
+			// close or a client disconnect (must stop silently). Cancellation
+			// alone is ambiguous — forward returns (false, nil) in every case.
+			var bootstrapTimedOut atomic.Bool
+			var idleStalled atomic.Bool
 			attemptCtx, cancel := context.WithCancel(ctx)
 			committedCh := make(chan struct{})
 			if !isLast {
 				go func() {
-					timer := time.NewTimer(comboAttemptTimeout)
+					timer := time.NewTimer(h.comboAttemptTimeout())
 					defer timer.Stop()
 					select {
 					case <-committedCh: // first byte forwarded — disarm
 					case <-attemptCtx.Done(): // request ended
 					case <-timer.C:
+						bootstrapTimedOut.Store(true)
 						cancel() // bootstrap stalled — abort, trigger fallback
 					}
 				}()
 			}
 			subData, subHeaders, subErr := h.executeStreamSingle(attemptCtx, handlerType, attempt.Model, rawJSON, alt)
 			// onCommit fires once, when the first visible byte is forwarded.
-			// onIdleStall (=cancel) lets the post-commit idle watchdog abort a
-			// stream that committed then stalled mid-generation.
-			committed, errMsg := forwardStreamAttemptOnCommit(attemptCtx, subData, subErr, dataChan, errChan, headers, subHeaders, newPublicStreamSanitizer(modelName), func() { close(committedCh) }, cancel)
+			// onIdleStall aborts a stream that committed then stalled
+			// mid-generation; it flags the reason before cancelling.
+			onIdleStall := context.CancelFunc(func() {
+				idleStalled.Store(true)
+				cancel()
+			})
+			committed, errMsg := forwardStreamAttemptOnCommit(attemptCtx, subData, subErr, dataChan, errChan, headers, subHeaders, newPublicStreamSanitizer(modelName), func() { close(committedCh) }, onIdleStall, h.comboStreamIdleTimeout())
 			if committed {
-				// Live stream owns attemptCtx for its full lifetime; it shares
-				// the parent's cancellation. Do NOT cancel here.
+				// Bytes already reached the client, so we cannot fall back —
+				// but a watchdog abort is still a degraded outcome and must not
+				// be booked as a clean success. Two cases reach here:
+				//   - idleStalled: committed then stalled mid-generation.
+				//   - bootstrapTimedOut: the first byte landed in the same
+				//     instant the bootstrap timer fired, so the select may have
+				//     cancelled the attempt even though it technically committed
+				//     (a nanosecond-wide race at exactly comboAttemptTimeout).
+				switch {
+				case idleStalled.Load():
+					h.recordComboAttempt(modelName, i, true, false, start, "idle_timeout")
+				case bootstrapTimedOut.Load():
+					h.recordComboAttempt(modelName, i, true, false, start, "timeout")
+				default:
+					// Live stream owns attemptCtx for its full lifetime; it
+					// shares the parent's cancellation. Do NOT cancel here.
+					h.recordComboAttempt(modelName, i, true, true, start, "")
+				}
 				return
 			}
 			cancel()
 			if errMsg == nil {
+				if bootstrapTimedOut.Load() {
+					// Bootstrap watchdog aborted this candidate before any
+					// byte was forwarded. Synthesize a timeout error so the
+					// loop falls through to the next entry instead of
+					// returning an empty 200 to the client.
+					errMsg = &interfaces.ErrorMessage{
+						StatusCode: http.StatusGatewayTimeout,
+						Error:      fmt.Errorf("combo candidate %q timed out before first byte", attempt.Model),
+					}
+					h.recordComboAttempt(modelName, i, true, false, start, "timeout")
+					lastErr = errMsg
+					// Watchdog only arms for non-last candidates, so there is
+					// always a later entry to try.
+					continue
+				}
+				if ctx != nil && ctx.Err() != nil {
+					// Parent context ended (client disconnect) — stop silently
+					// without booking a success.
+					return
+				}
 				// Stream closed cleanly without forwarding any payload —
 				// treat as a soft success from the upstream's POV. The
 				// caller probably wants a 200 with empty body; the
 				// underlying handler decides. There's nothing more to do.
+				h.recordComboAttempt(modelName, i, true, true, start, "")
 				return
 			}
+			triggerReason := h.classifyFallbackReason(errMsg)
+			h.recordComboAttempt(modelName, i, true, false, start, triggerReason)
 			lastErr = errMsg
 			if isLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
 				_ = sendStreamErr(ctx, errChan, errMsg)
@@ -947,7 +1054,7 @@ func forwardStreamAttempt(
 	subHeaders http.Header,
 	sanitizer *publicStreamSanitizer,
 ) (bool, *interfaces.ErrorMessage) {
-	return forwardStreamAttemptOnCommit(ctx, subData, subErr, dataChan, errChan, headers, subHeaders, sanitizer, nil, nil)
+	return forwardStreamAttemptOnCommit(ctx, subData, subErr, dataChan, errChan, headers, subHeaders, sanitizer, nil, nil, comboStreamIdleTimeout)
 }
 
 // forwardStreamAttemptOnCommit is forwardStreamAttempt with an optional
@@ -966,6 +1073,7 @@ func forwardStreamAttemptOnCommit(
 	sanitizer *publicStreamSanitizer,
 	onCommit func(),
 	onIdleStall context.CancelFunc,
+	idleTimeout time.Duration,
 ) (bool, *interfaces.ErrorMessage) {
 	// Adopt the underlying stream's headers up-front so combo entries
 	// that share a header set still surface the right Content-Type etc.
@@ -981,24 +1089,22 @@ func forwardStreamAttemptOnCommit(
 	// on commit and reset on every upstream byte, so a steadily-producing
 	// long generation is never cut — only a genuine stall trips it.
 	var idle *time.Timer
-	idleFired := make(chan struct{})
 	armIdle := func() {
-		if onIdleStall == nil || comboStreamIdleTimeout <= 0 {
+		if onIdleStall == nil || idleTimeout <= 0 {
 			return
 		}
-		idle = time.NewTimer(comboStreamIdleTimeout)
+		idle = time.NewTimer(idleTimeout)
 		go func() {
 			select {
 			case <-idle.C:
 				onIdleStall() // stall — cancel the attempt ctx, ending the stream
-				close(idleFired)
 			case <-ctx.Done():
 			}
 		}()
 	}
 	resetIdle := func() {
 		if idle != nil {
-			idle.Reset(comboStreamIdleTimeout)
+			idle.Reset(idleTimeout)
 		}
 	}
 	defer func() {
@@ -1644,6 +1750,61 @@ func isTransportError(body string) bool {
 		}
 	}
 	return false
+}
+
+// recordComboAttempt records one combo candidate outcome when a metrics
+// recorder is wired. It is a no-op for non-combo (single-attempt) requests
+// so plain model requests do not pollute the combo metrics sink.
+func (h *BaseAPIHandler) recordComboAttempt(comboName string, entryIndex int, isCombo bool, success bool, start time.Time, triggerReason string) {
+	if !isCombo || h == nil || h.ComboMetrics == nil {
+		return
+	}
+	h.ComboMetrics.Record(comboName, entryIndex, success, time.Since(start), triggerReason)
+}
+
+// classifyFallbackReason returns a short trigger reason for a failed combo
+// attempt. It is best-effort and used only for metrics tagging.
+func (h *BaseAPIHandler) classifyFallbackReason(errMsg *interfaces.ErrorMessage) string {
+	if errMsg == nil {
+		return ""
+	}
+	body := ""
+	if errMsg.Error != nil {
+		body = errMsg.Error.Error()
+	}
+	// The per-attempt watchdog (comboAttemptTimeout) cancels a hung candidate
+	// via context deadline. Surface that as its own reason — timeouts are the
+	// primary signal operators watch, and folding them into transport_error
+	// would hide how often combo candidates stall.
+	lowerBody := strings.ToLower(body)
+	if strings.Contains(lowerBody, "context deadline exceeded") || strings.Contains(lowerBody, "context canceled") {
+		return "timeout"
+	}
+	if isTransportError(body) {
+		return "transport_error"
+	}
+	switch errMsg.StatusCode {
+	case http.StatusTooManyRequests:
+		return "rate_limited"
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusPaymentRequired:
+		return "auth_error"
+	case http.StatusBadRequest:
+		if isModelSupportBodyMessage(body) {
+			return "model_not_supported"
+		}
+		if isProviderBusyBodyMessage(body) {
+			return "provider_busy"
+		}
+		return "bad_request"
+	case http.StatusNotFound:
+		return "not_found"
+	case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout:
+		return "upstream_unavailable"
+	}
+	if errMsg.StatusCode >= 500 {
+		return "server_error"
+	}
+	return "provider_error"
 }
 
 // isModelSupportBodyMessage matches the same patterns the auth conductor

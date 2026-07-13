@@ -91,7 +91,10 @@ func TestExecuteStreamWithAuthManager_PostCommitIdleStallBounded(t *testing.T) {
 		registry.GetGlobalRegistry().UnregisterClient(authFast.ID)
 	})
 
-	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		ComboAttemptTimeoutSeconds:    30,
+		ComboStreamIdleTimeoutSeconds: 1,
+	}, manager)
 	handler.Combos = &fakeComboResolver{chains: map[string][]ComboCandidate{
 		"combo-stall": {
 			{Model: "stallprov/stall"},

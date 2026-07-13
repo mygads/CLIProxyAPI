@@ -175,6 +175,23 @@ func (a *comboResolverAdapter) DisplayName(name string) string {
 	return a.reg.DisplayName(name)
 }
 
+// Metrics exposes the underlying combo metrics registry so the handler can
+// record per-attempt outcomes.
+func (a *comboResolverAdapter) Metrics() *combo.MetricsRegistry {
+	if a == nil || a.reg == nil {
+		return nil
+	}
+	return a.reg.Metrics()
+}
+
+// Record delegates to the underlying combo metrics registry.
+func (a *comboResolverAdapter) Record(comboName string, entryIndex int, success bool, latency time.Duration, triggerReason string) {
+	if a == nil || a.reg == nil {
+		return
+	}
+	a.reg.Metrics().Record(comboName, entryIndex, success, latency, triggerReason)
+}
+
 // ListNames satisfies the optional interface OpenAIModels uses to inject
 // combo names into /v1/models. Without this the type assertion in
 // `sdk/api/handlers/openai/openai_handlers.go` (`h.Combos.(interface{ ListNames() []string })`)
@@ -384,7 +401,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		// so the SDK handlers package sees the interface shape it
 		// expects without the internal/combo package leaking into it.
 		if s.handlers != nil {
-			s.handlers.Combos = &comboResolverAdapter{reg: comboReg}
+			adapter := &comboResolverAdapter{reg: comboReg}
+			s.handlers.Combos = adapter
+			s.handlers.ComboMetrics = adapter
 		}
 	}
 

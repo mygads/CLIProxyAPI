@@ -84,7 +84,9 @@ func TestExecuteWithAuthManager_PerAttemptTimeoutFallsThrough(t *testing.T) {
 		registry.GetGlobalRegistry().UnregisterClient(authFast.ID)
 	})
 
-	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		ComboAttemptTimeoutSeconds: 1,
+	}, manager)
 	handler.Combos = &fakeComboResolver{chains: map[string][]ComboCandidate{
 		"combo-timeout": {
 			{Model: "hangprov/hang"},

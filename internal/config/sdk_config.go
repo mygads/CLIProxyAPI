@@ -59,6 +59,16 @@ type SDKConfig struct {
 	// Applies to all executors (Kiro, Claude, OpenAI-compat, Gemini, etc.).
 	// Default is 180 seconds. Set to 0 for no timeout (not recommended).
 	UpstreamTimeoutSeconds int `yaml:"upstream-timeout-seconds,omitempty" json:"upstream-timeout-seconds,omitempty"`
+
+	// ComboAttemptTimeoutSeconds caps how long a single non-last combo candidate may run
+	// before it is abandoned and the loop falls through to the next entry.
+	// Default is 15 seconds. Set to 0 to disable the per-attempt timeout (not recommended).
+	ComboAttemptTimeoutSeconds int `yaml:"combo-attempt-timeout-seconds,omitempty" json:"combo-attempt-timeout-seconds,omitempty"`
+
+	// ComboStreamIdleTimeoutSeconds bounds how long an already-committed combo stream
+	// may go without receiving any byte from the upstream before it is abandoned.
+	// Default is 60 seconds. Set to 0 to disable the idle timeout (not recommended).
+	ComboStreamIdleTimeoutSeconds int `yaml:"combo-stream-idle-timeout-seconds,omitempty" json:"combo-stream-idle-timeout-seconds,omitempty"`
 }
 
 // UpstreamTimeout returns the configured upstream timeout duration.
@@ -68,6 +78,39 @@ func (c *SDKConfig) UpstreamTimeout() time.Duration {
 		return 300 * time.Second
 	}
 	return time.Duration(c.UpstreamTimeoutSeconds) * time.Second
+}
+
+// defaultComboAttemptTimeout bounds time-to-first-byte for a non-last combo
+// candidate. Kept short (15s) so a hung upstream that never emits a byte falls
+// through to the next candidate quickly instead of stalling the whole request
+// for ~45-60s — the dominant cause of tool-calling requests that surfaced as
+// prompt=0 / ~50s latency and made coding agents give up mid-run. The ctx
+// cancel on timeout closes the upstream HTTP connection, so an abandoned
+// attempt is not billed by the provider.
+const defaultComboAttemptTimeout = 15 * time.Second
+
+// defaultComboStreamIdleTimeout bounds a post-commit stall (stream already
+// producing, then goes silent). Kept longer (60s) than the bootstrap timeout
+// so a genuinely long but steadily-producing generation is never cut short —
+// the timer resets on every upstream byte.
+const defaultComboStreamIdleTimeout = 60 * time.Second
+
+// ComboAttemptTimeout returns the configured per-attempt combo timeout.
+// Defaults to 15s if not set or zero.
+func (c *SDKConfig) ComboAttemptTimeout() time.Duration {
+	if c == nil || c.ComboAttemptTimeoutSeconds <= 0 {
+		return defaultComboAttemptTimeout
+	}
+	return time.Duration(c.ComboAttemptTimeoutSeconds) * time.Second
+}
+
+// ComboStreamIdleTimeout returns the configured post-commit combo idle timeout.
+// Defaults to 60s if not set or zero.
+func (c *SDKConfig) ComboStreamIdleTimeout() time.Duration {
+	if c == nil || c.ComboStreamIdleTimeoutSeconds <= 0 {
+		return defaultComboStreamIdleTimeout
+	}
+	return time.Duration(c.ComboStreamIdleTimeoutSeconds) * time.Second
 }
 
 // StreamingConfig holds server streaming behavior configuration.
