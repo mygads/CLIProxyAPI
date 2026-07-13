@@ -81,13 +81,16 @@ func (c *SDKConfig) UpstreamTimeout() time.Duration {
 }
 
 // defaultComboAttemptTimeout bounds time-to-first-byte for a non-last combo
-// candidate. Kept short (15s) so a hung upstream that never emits a byte falls
-// through to the next candidate quickly instead of stalling the whole request
-// for ~45-60s — the dominant cause of tool-calling requests that surfaced as
-// prompt=0 / ~50s latency and made coding agents give up mid-run. The ctx
-// cancel on timeout closes the upstream HTTP connection, so an abandoned
-// attempt is not billed by the provider.
-const defaultComboAttemptTimeout = 15 * time.Second
+// candidate before the loop falls through to the next entry. Set to 120s to
+// accommodate reasoning/thinking models (opus-4.8, gpt-5.5) that legitimately
+// take a long time to emit their first byte — a shorter bound (e.g. 15s) cut
+// those off mid-think and forced a fallthrough that could end in failure even
+// though the candidate would have succeeded given time. The post-commit idle
+// timeout still bounds a stream that starts then stalls, and the ctx cancel on
+// timeout closes the upstream HTTP connection so an abandoned attempt is not
+// billed by the provider. Operators can override via
+// combo-attempt-timeout-seconds in config.
+const defaultComboAttemptTimeout = 120 * time.Second
 
 // defaultComboStreamIdleTimeout bounds a post-commit stall (stream already
 // producing, then goes silent). Kept longer (60s) than the bootstrap timeout

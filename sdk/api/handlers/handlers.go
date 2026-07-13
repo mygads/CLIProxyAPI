@@ -660,9 +660,11 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 //
 // Production code reads the configured value from SDKConfig via the
 // comboAttemptTimeout method; this var is kept so existing tests can still
-// shrink it by assigning directly. 15s: fall through fast when a candidate
-// hangs before its first byte instead of stalling the request ~45-60s.
-var comboAttemptTimeout = 15 * time.Second
+// shrink it by assigning directly. 120s: accommodate reasoning/thinking models
+// that are slow to emit their first byte; the post-commit idle watchdog still
+// bounds a stream that starts then stalls. Override via
+// combo-attempt-timeout-seconds in config.
+var comboAttemptTimeout = 120 * time.Second
 
 // defaultComboStreamIdleTimeout bounds how long an ALREADY-COMMITTED stream may go
 // without receiving any byte from the upstream before it is abandoned. The
