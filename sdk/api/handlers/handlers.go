@@ -993,12 +993,18 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 					// without booking a success.
 					return
 				}
-				// Stream closed cleanly without forwarding any payload —
-				// treat as a soft success from the upstream's POV. The
-				// caller probably wants a 200 with empty body; the
-				// underlying handler decides. There's nothing more to do.
-				h.recordComboAttempt(modelName, i, true, true, start, "")
-				return
+				// A completion stream that closes without a single visible
+				// payload is not a successful completion. Treat it as an
+				// upstream failure so combo routing can continue instead of
+				// returning HTTP 200 with an empty body to the gateway.
+				errMsg = emptyUpstreamResponseError(attempt.Model)
+				h.recordComboAttempt(modelName, i, true, false, start, "empty_response")
+				lastErr = errMsg
+				if isLast {
+					_ = sendStreamErr(ctx, errChan, errMsg)
+					return
+				}
+				continue
 			}
 			triggerReason := h.classifyFallbackReason(errMsg)
 			h.recordComboAttempt(modelName, i, true, false, start, triggerReason)
@@ -1015,6 +1021,13 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	}()
 
 	return dataChan, headers, errChan
+}
+
+func emptyUpstreamResponseError(model string) *interfaces.ErrorMessage {
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadGateway,
+		Error:      fmt.Errorf("upstream model %q returned an empty response", model),
+	}
 }
 
 func sanitizePublicStream(data <-chan []byte, publicModel string) <-chan []byte {
@@ -1779,6 +1792,9 @@ func (h *BaseAPIHandler) classifyFallbackReason(errMsg *interfaces.ErrorMessage)
 	// primary signal operators watch, and folding them into transport_error
 	// would hide how often combo candidates stall.
 	lowerBody := strings.ToLower(body)
+	if strings.Contains(lowerBody, "empty_stream") || strings.Contains(lowerBody, "empty response") {
+		return "empty_response"
+	}
 	if strings.Contains(lowerBody, "context deadline exceeded") || strings.Contains(lowerBody, "context canceled") {
 		return "timeout"
 	}

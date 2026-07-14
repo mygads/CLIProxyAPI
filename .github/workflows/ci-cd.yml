@@ -32,9 +32,32 @@ env:
   APP_DIR: /home/cicddeploy/genfity/ai-core2
 
 jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.deploy_only != 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test ./...
+
   build:
     name: Build & Push Image
     runs-on: ubuntu-latest
+    needs: [test]
     if: ${{ github.event.inputs.deploy_only != 'true' }}
     permissions:
       contents: read
@@ -60,6 +83,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=sha,prefix=
+            type=sha,prefix=,format=long
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker image
@@ -120,22 +144,34 @@ jobs:
             # pushed image.
             echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u mygads --password-stdin
 
-            # Pull latest image when available. Some hosts still resolve this
-            # service as build-based or can temporarily reference a missing
-            # registry digest; in that case rebuild from the just-synced source
-            # tree instead of failing the whole deploy.
-            if ! docker compose pull cli-proxy-api; then
-              echo "docker compose pull failed; rebuilding cli-proxy-api from source"
-              docker compose build cli-proxy-api
+            # The object-store backend owns the active config. Keep the legacy
+            # bind source a regular file so Docker does not silently create a
+            # config.yaml directory when the ignored local file is absent.
+            if [ -d config.yaml ]; then
+              rmdir config.yaml
             fi
+            touch config.yaml
+
+            # Pin deployment to the immutable commit tag. :latest is mutable
+            # and cannot prove which revision is actually running.
+            export CLI_PROXY_IMAGE=ghcr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            docker compose pull cli-proxy-api
             docker compose up -d --force-recreate cli-proxy-api
 
-            # Health check: management endpoint requires auth, but /v1/models
-            # is gated by api-key. We just verify the port answers.
+            EXPECTED="${{ github.sha }}"
+            RUNNING=$(docker inspect cli-proxy-api --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+            echo "Expected revision: $EXPECTED"
+            echo "Running revision:  $RUNNING"
+            if [ "$RUNNING" != "$EXPECTED" ]; then
+              echo "Deployed revision mismatch"
+              exit 1
+            fi
+
+            # Health check the dedicated unauthenticated endpoint.
             sleep 8
             for i in 1 2 3 4 5; do
-              code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8317/v1/models -H 'Authorization: Bearer healthcheck-probe' || true)
-              if [ "$code" = "401" ] || [ "$code" = "200" ]; then
+              code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8317/healthz || true)
+              if [ "$code" = "200" ]; then
                 echo "Health check ok (HTTP $code)"
                 exit 0
               fi

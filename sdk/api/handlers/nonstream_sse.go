@@ -24,7 +24,10 @@ type nonStreamingSSEChoiceState struct {
 // promoted to an ErrorMessage so combo fallback can try the next candidate.
 func normalizeNonStreamingPayload(payload []byte) ([]byte, *interfaces.ErrorMessage) {
 	trimmed := bytes.TrimSpace(payload)
-	if len(trimmed) == 0 || !looksLikeSSEChunk(trimmed) {
+	if len(trimmed) == 0 {
+		return nil, emptyUpstreamResponseError("")
+	}
+	if !looksLikeSSEChunk(trimmed) {
 		return payload, nil
 	}
 
