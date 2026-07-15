@@ -2,6 +2,7 @@ package responses
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
@@ -368,6 +369,16 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 		out, _ = sjson.SetRawBytes(out, "contents.-1", userContent)
 	}
 
+	// Gemini/Vertex accepts assistant/model turns in history, but some model
+	// surfaces reject requests whose final turn is model-authored prefill.
+	contents := gjson.GetBytes(out, "contents")
+	if contents.Exists() && contents.IsArray() {
+		arr := contents.Array()
+		if len(arr) > 0 && arr[len(arr)-1].Get("role").String() == "model" {
+			out, _ = sjson.DeleteBytes(out, fmt.Sprintf("contents.%d", len(arr)-1))
+		}
+	}
+
 	// Convert tools to Gemini functionDeclarations format
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
 		geminiTools := []byte(`[{"functionDeclarations":[]}]`)
@@ -383,7 +394,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 					funcDecl, _ = sjson.SetBytes(funcDecl, "description", desc.String())
 				}
 				if params := tool.Get("parameters"); params.Exists() {
-					funcDecl, _ = sjson.SetRawBytes(funcDecl, "parametersJsonSchema", []byte(params.Raw))
+					funcDecl, _ = sjson.SetRawBytes(funcDecl, "parametersJsonSchema", []byte(util.CleanJSONSchemaForGemini(params.Raw)))
 				}
 
 				geminiTools, _ = sjson.SetRawBytes(geminiTools, "0.functionDeclarations.-1", funcDecl)

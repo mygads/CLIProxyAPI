@@ -6,6 +6,34 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestConvertOpenAIResponsesRequestToClaudeSanitizesToolCallIDs(t *testing.T) {
+	input := []byte(`{"input":[
+		{"type":"function_call","call_id":"call.with space:1","name":"Read","arguments":"{}"},
+		{"type":"function_call_output","call_id":"call.with space:1","output":"ok"}
+	]}`)
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", input, false)
+	toolUseID := gjson.GetBytes(out, "messages.0.content.0.id").String()
+	toolResultID := gjson.GetBytes(out, "messages.1.content.0.tool_use_id").String()
+	if toolUseID != "call_with_space_1" || toolResultID != toolUseID {
+		t.Fatalf("tool IDs not consistently sanitized: use=%q result=%q; output=%s", toolUseID, toolResultID, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaudeKeepsToolUseAdjacentToResult(t *testing.T) {
+	input := []byte(`{"input":[
+		{"type":"function_call","call_id":"call_1","name":"js","arguments":"{}"},
+		{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Checking first."}]},
+		{"type":"function_call_output","call_id":"call_1","output":"ok"}
+	]}`)
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", input, false)
+	root := gjson.ParseBytes(out)
+	if root.Get("messages.0.content").String() != "Checking first." ||
+		root.Get("messages.1.content.0.type").String() != "tool_use" ||
+		root.Get("messages.2.content.0.type").String() != "tool_result" {
+		t.Fatalf("tool use/result are not adjacent after assistant text: %s", out)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToClaude_ReasoningItemToThinkingBlock(t *testing.T) {
 	signature := "claude_sig_request"
 	raw := []byte(`{

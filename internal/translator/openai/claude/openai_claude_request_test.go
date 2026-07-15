@@ -6,6 +6,27 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestConvertClaudeRequestToOpenAIToolSchemaAddsMissingObjectProperties(t *testing.T) {
+	input := []byte(`{
+		"tools":[
+			{"name":"empty","input_schema":{"type":"object"}},
+			{"name":"nested","input_schema":{"type":"object","properties":{"nested":{"type":"object"},"items":{"type":"array","items":{"type":"object"}}}}}
+		],
+		"messages":[{"role":"user","content":"hello"}]
+	}`)
+	out := ConvertClaudeRequestToOpenAI("test-model", input, false)
+	for _, path := range []string{
+		"tools.0.function.parameters.properties",
+		"tools.1.function.parameters.properties.nested.properties",
+		"tools.1.function.parameters.properties.items.items.properties",
+	} {
+		got := gjson.GetBytes(out, path)
+		if !got.Exists() || !got.IsObject() {
+			t.Fatalf("missing object properties at %s; output=%s", path, out)
+		}
+	}
+}
+
 // TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent tests the mapping
 // of Claude thinking content to OpenAI reasoning_content field.
 func TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent(t *testing.T) {

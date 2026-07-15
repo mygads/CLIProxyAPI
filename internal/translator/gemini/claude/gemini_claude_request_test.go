@@ -6,6 +6,24 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestConvertClaudeRequestToGeminiStructuredToolResult(t *testing.T) {
+	input := []byte(`{"messages":[
+		{"role":"assistant","content":[{"type":"tool_use","id":"json-call-1","name":"json","input":{}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"json-call-1","content":[
+			{"type":"text","text":"alpha"},
+			{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}
+		]}]}
+	]}`)
+	out := ConvertClaudeRequestToGemini("gemini-test", input, false)
+	if got := gjson.GetBytes(out, "contents.1.parts.0.functionResponse.response.result.text").String(); got != "alpha" {
+		t.Fatalf("structured result lost: got=%q output=%s", got, out)
+	}
+	img := gjson.GetBytes(out, "contents.1.parts.1.inline_data")
+	if img.Get("mime_type").String() != "image/png" || img.Get("data").String() != "aGVsbG8=" {
+		t.Fatalf("image was not separated from tool result: %s", out)
+	}
+}
+
 func TestConvertClaudeRequestToGemini_ToolChoice_SpecificTool(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "gemini-3-flash-preview",

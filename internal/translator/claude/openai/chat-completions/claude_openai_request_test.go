@@ -6,6 +6,21 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestConvertOpenAIRequestToClaudeSanitizesToolCallIDs(t *testing.T) {
+	input := []byte(`{
+		"messages":[
+			{"role":"assistant","tool_calls":[{"id":"call.with space:1","type":"function","function":{"name":"Read","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call.with space:1","content":"ok"}
+		]
+	}`)
+	out := ConvertOpenAIRequestToClaude("claude-test", input, false)
+	toolUseID := gjson.GetBytes(out, "messages.0.content.0.id").String()
+	toolResultID := gjson.GetBytes(out, "messages.1.content.0.tool_use_id").String()
+	if toolUseID != "call_with_space_1" || toolResultID != toolUseID {
+		t.Fatalf("tool IDs not consistently sanitized: use=%q result=%q; output=%s", toolUseID, toolResultID, out)
+	}
+}
+
 func TestConvertOpenAIRequestToClaude_ToolResultTextAndBase64Image(t *testing.T) {
 	inputJSON := `{
 		"model": "gpt-4.1",

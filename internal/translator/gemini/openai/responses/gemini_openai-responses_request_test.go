@@ -6,6 +6,33 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestConvertOpenAIResponsesRequestToGeminiStripsTrailingAssistantPrefill(t *testing.T) {
+	input := []byte(`{"input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},
+		{"type":"message","role":"assistant","content":[{"type":"output_text","text":"prefill"}]}
+	]}`)
+	out := ConvertOpenAIResponsesRequestToGemini("gemini-test", input, false)
+	contents := gjson.GetBytes(out, "contents").Array()
+	if len(contents) != 1 || contents[0].Get("role").String() != "user" {
+		t.Fatalf("unexpected contents after prefill removal: %s", gjson.GetBytes(out, "contents").Raw)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToGeminiCleansToolSchema(t *testing.T) {
+	input := []byte(`{
+		"input":"hi",
+		"tools":[{"type":"function","name":"search","parameters":{
+			"type":"object","title":"Search","properties":{"country":{"type":"string"}},"required":["country","stale"]
+		}}]
+	}`)
+	out := ConvertOpenAIResponsesRequestToGemini("gemini-test", input, false)
+	schema := gjson.GetBytes(out, "tools.0.functionDeclarations.0.parametersJsonSchema")
+	required := schema.Get("required").Array()
+	if schema.Get("title").Exists() || len(required) != 1 || required[0].String() != "country" {
+		t.Fatalf("schema was not sanitized: %s", schema.Raw)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToGemini_SystemAndDeveloperRoles(t *testing.T) {
 	// Test system role conversion
 	systemInput := []byte(`{

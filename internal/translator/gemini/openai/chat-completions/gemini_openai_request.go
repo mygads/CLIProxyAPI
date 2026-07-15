@@ -67,6 +67,13 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 		out, _ = sjson.SetBytes(out, "generationConfig.topK", tkr.Num)
 	}
 
+	// OpenAI max_tokens / max_completion_tokens -> Gemini generationConfig.maxOutputTokens
+	if mt := gjson.GetBytes(rawJSON, "max_tokens"); mt.Exists() && mt.Type == gjson.Number {
+		out, _ = sjson.SetBytes(out, "generationConfig.maxOutputTokens", mt.Num)
+	} else if mct := gjson.GetBytes(rawJSON, "max_completion_tokens"); mct.Exists() && mct.Type == gjson.Number {
+		out, _ = sjson.SetBytes(out, "generationConfig.maxOutputTokens", mct.Num)
+	}
+
 	// Candidate count (OpenAI 'n' parameter)
 	if n := gjson.GetBytes(rawJSON, "n"); n.Exists() && n.Type == gjson.Number {
 		if val := n.Int(); val > 1 {
@@ -293,6 +300,16 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 		}
 	}
 
+	// Gemini/Vertex accepts assistant/model turns in history, but some model
+	// surfaces reject requests whose final turn is model-authored prefill.
+	contents := gjson.GetBytes(out, "contents")
+	if contents.Exists() && contents.IsArray() {
+		arr := contents.Array()
+		if len(arr) > 0 && arr[len(arr)-1].Get("role").String() == "model" {
+			out, _ = sjson.DeleteBytes(out, fmt.Sprintf("contents.%d", len(arr)-1))
+		}
+	}
+
 	// tools -> tools[].functionDeclarations + tools[].googleSearch/codeExecution/urlContext passthrough
 	tools := gjson.GetBytes(rawJSON, "tools")
 	if tools.IsArray() && len(tools.Array()) > 0 {
@@ -344,6 +361,9 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 					fnRawBytes := []byte(fnRaw)
 					fnRawBytes, _ = sjson.SetBytes(fnRawBytes, "name", util.SanitizeFunctionName(fn.Get("name").String()))
 					fnRaw = string(fnRawBytes)
+					if parameters := gjson.Get(fnRaw, "parametersJsonSchema"); parameters.Exists() {
+						fnRaw, _ = sjson.SetRaw(fnRaw, "parametersJsonSchema", util.CleanJSONSchemaForGemini(parameters.Raw))
+					}
 					fnRaw, _ = sjson.Delete(fnRaw, "strict")
 					if !hasFunction {
 						functionToolNode, _ = sjson.SetRawBytes(functionToolNode, "functionDeclarations", []byte("[]"))
