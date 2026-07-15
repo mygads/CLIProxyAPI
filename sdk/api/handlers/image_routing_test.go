@@ -103,3 +103,13 @@ func TestMaybeImageRerouteGuards(t *testing.T) {
 		}
 	})
 }
+
+func TestImageRoutingExecutionKeyIsolatedFromNormalCombo(t *testing.T) {
+	got := imageRoutingExecutionKey(" Genfity/Claude-Opus-4.8 ")
+	if got != "image-routing:genfity/claude-opus-4.8" {
+		t.Fatalf("key=%q", got)
+	}
+	if got == "genfity/claude-opus-4.8" {
+		t.Fatal("image routing health/metrics key must not collide with normal combo")
+	}
+}

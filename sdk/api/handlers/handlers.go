@@ -648,10 +648,12 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	// list is exhausted. For single-model requests this collapses to the
 	// same single-call behaviour the code had before combos existed.
 	attempts := h.resolveModelAttempts(modelName)
+	routeName := modelName
 	// Image override: an image-carrying request to a flagged combo runs the
 	// dedicated image chain INSTEAD of the combo's normal chain (isolated).
 	if imgAttempts, ok := h.maybeImageReroute(modelName, rawJSON); ok {
 		attempts = imgAttempts
+		routeName = imageRoutingExecutionKey(modelName)
 	}
 	isCombo := len(attempts) > 1
 	var lastIncompatible error
@@ -659,21 +661,21 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		if isKiroServer3Candidate(attempt.Model) {
 			if issue := kiroPayloadCompatibilityIssue(rawJSON); issue != nil {
 				lastIncompatible = incompatibleKiroPayloadError(attempt.Model, issue.Reason)
-				h.recordIncompatiblePayloadSkip(ctx, modelName, i, attempt.Model, isCombo, issue)
+				h.recordIncompatiblePayloadSkip(ctx, routeName, i, attempt.Model, isCombo, issue)
 				continue
 			}
 		}
-		if isCombo && i < len(attempts)-1 && !h.comboCandidateAvailable(modelName, attempt.Model) {
+		if isCombo && i < len(attempts)-1 && !h.comboCandidateAvailable(routeName, attempt.Model) {
 			continue
 		}
 		start := time.Now()
 		resp, headers, errMsg := h.executeSingleWithAttemptTimeout(ctx, handlerType, attempt, rawJSON, alt)
 		if errMsg == nil {
 			if !attempt.IsLast && shouldFallbackMalformedToolCallResponse(rawJSON, resp) {
-				h.recordComboAttempt(modelName, i, attempt.Model, isCombo, false, start, "malformed_tool_response")
+				h.recordComboAttempt(routeName, i, attempt.Model, isCombo, false, start, "malformed_tool_response")
 				continue
 			}
-			h.recordComboAttempt(modelName, i, attempt.Model, isCombo, true, start, "")
+			h.recordComboAttempt(routeName, i, attempt.Model, isCombo, true, start, "")
 			return SanitizePublicResponse(resp, modelName), headers, nil
 		}
 		triggerReason := h.classifyFallbackReason(errMsg)
@@ -683,7 +685,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 			// fallback work after the caller has gone away.
 			return nil, nil, errMsg
 		}
-		h.recordComboAttempt(modelName, i, attempt.Model, isCombo, false, start, triggerReason)
+		h.recordComboAttempt(routeName, i, attempt.Model, isCombo, false, start, triggerReason)
 		if attempt.IsLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
 			return nil, nil, errMsg
 		}
@@ -939,10 +941,12 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	rawJSON = h.injectComboLanguageGuard(handlerType, modelName, rawJSON)
 
 	attempts := h.resolveModelAttempts(modelName)
+	routeName := modelName
 	// Image override: an image-carrying request to a flagged combo runs the
 	// dedicated image chain INSTEAD of the combo's normal chain (isolated).
 	if imgAttempts, ok := h.maybeImageReroute(modelName, rawJSON); ok {
 		attempts = imgAttempts
+		routeName = imageRoutingExecutionKey(modelName)
 	}
 	// Single-candidate path skips the buffered indirection so existing
 	// non-combo behaviour stays bit-for-bit identical (header timing,
@@ -954,7 +958,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		}
 		if isKiroServer3Candidate(target) {
 			if issue := kiroPayloadCompatibilityIssue(rawJSON); issue != nil {
-				h.recordIncompatiblePayloadSkip(ctx, modelName, 0, target, false, issue)
+				h.recordIncompatiblePayloadSkip(ctx, routeName, 0, target, false, issue)
 				dataChan := make(chan []byte)
 				errChan := make(chan *interfaces.ErrorMessage, 1)
 				close(dataChan)
@@ -991,12 +995,12 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 			}
 			if isKiroServer3Candidate(attempt.Model) {
 				if issue := kiroPayloadCompatibilityIssue(rawJSON); issue != nil {
-					h.recordIncompatiblePayloadSkip(ctx, modelName, i, attempt.Model, true, issue)
+					h.recordIncompatiblePayloadSkip(ctx, routeName, i, attempt.Model, true, issue)
 					lastErr = &interfaces.ErrorMessage{StatusCode: http.StatusUnprocessableEntity, Error: incompatibleKiroPayloadError(attempt.Model, issue.Reason)}
 					continue
 				}
 			}
-			if i < len(attempts)-1 && !h.comboCandidateAvailable(modelName, attempt.Model) {
+			if i < len(attempts)-1 && !h.comboCandidateAvailable(routeName, attempt.Model) {
 				continue
 			}
 			start := time.Now()
@@ -1052,13 +1056,13 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				//     (a nanosecond-wide race at exactly comboAttemptTimeout).
 				switch {
 				case idleStalled.Load():
-					h.recordComboAttempt(modelName, i, attempt.Model, true, false, start, "idle_timeout")
+					h.recordComboAttempt(routeName, i, attempt.Model, true, false, start, "idle_timeout")
 				case bootstrapTimedOut.Load():
-					h.recordComboAttempt(modelName, i, attempt.Model, true, false, start, "timeout")
+					h.recordComboAttempt(routeName, i, attempt.Model, true, false, start, "timeout")
 				default:
 					// Live stream owns attemptCtx for its full lifetime; it
 					// shares the parent's cancellation. Do NOT cancel here.
-					h.recordComboAttempt(modelName, i, attempt.Model, true, true, start, "")
+					h.recordComboAttempt(routeName, i, attempt.Model, true, true, start, "")
 				}
 				return
 			}
@@ -1073,7 +1077,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 						StatusCode: http.StatusGatewayTimeout,
 						Error:      fmt.Errorf("combo candidate %q timed out before first byte", attempt.Model),
 					}
-					h.recordComboAttempt(modelName, i, attempt.Model, true, false, start, "timeout")
+					h.recordComboAttempt(routeName, i, attempt.Model, true, false, start, "timeout")
 					lastErr = errMsg
 					// Watchdog only arms for non-last candidates, so there is
 					// always a later entry to try.
@@ -1089,7 +1093,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				// upstream failure so combo routing can continue instead of
 				// returning HTTP 200 with an empty body to the gateway.
 				errMsg = emptyUpstreamResponseError(attempt.Model)
-				h.recordComboAttempt(modelName, i, attempt.Model, true, false, start, "empty_response")
+				h.recordComboAttempt(routeName, i, attempt.Model, true, false, start, "empty_response")
 				lastErr = errMsg
 				if isLast {
 					_ = sendStreamErr(ctx, errChan, errMsg)
@@ -1103,7 +1107,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				// this combo candidate is unhealthy.
 				return
 			}
-			h.recordComboAttempt(modelName, i, attempt.Model, true, false, start, triggerReason)
+			h.recordComboAttempt(routeName, i, attempt.Model, true, false, start, triggerReason)
 			lastErr = errMsg
 			if isLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
 				_ = sendStreamErr(ctx, errChan, errMsg)
@@ -1644,6 +1648,10 @@ func (h *BaseAPIHandler) maybeImageReroute(modelName string, rawJSON []byte) ([]
 		return nil, false
 	}
 	return attempts, true
+}
+
+func imageRoutingExecutionKey(modelName string) string {
+	return "image-routing:" + strings.ToLower(strings.TrimSpace(modelName))
 }
 
 // resolveImageAttempts expands the global image chain into leaf attempts,
