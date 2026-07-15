@@ -687,18 +687,19 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 // before it is abandoned and the loop falls through to the next entry. Some
 // upstreams accept the connection but never respond (or stall mid-generation);
 // combo fallback only fires on an *error*, so without a per-attempt deadline a
-// hung head entry pins the whole request until the gateway's 120s client
-// timeout — defeating the fallback and surfacing as provider_error/500 with
-// ~125s latency. The LAST/only attempt is exempt: it keeps the full request
-// budget so a genuinely long single-model generation is not cut short.
+// hung head entry can pin the whole request until its outer request deadline.
+// The LAST/only attempt is exempt: it keeps the full request budget so a
+// genuinely long single-model generation is not cut short.
 //
 // Production code reads the configured value from SDKConfig via the
 // comboAttemptTimeout method; this var is kept so existing tests can still
-// shrink it by assigning directly. Thirty seconds bounds only bootstrap, not
-// the full generation, and lets the chain reach later candidates before common
-// 60s client idle deadlines. Override via
-// combo-attempt-timeout-seconds in config.
-var comboAttemptTimeout = 30 * time.Second
+// shrink it by assigning directly. The 120-second production default avoids
+// cancelling slow reasoning providers that may keep computing (and billing)
+// after the client connection is cancelled. Explicit provider errors and empty
+// closes still trigger fallback immediately; streaming heartbeats keep the
+// downstream connection alive during legitimate long bootstrap work. Override
+// via combo-attempt-timeout-seconds in config.
+var comboAttemptTimeout = 120 * time.Second
 
 // comboStreamKeepaliveInterval keeps downstream SSE readers alive while a
 // combo candidate is still bootstrapping or while fallback is in progress.
