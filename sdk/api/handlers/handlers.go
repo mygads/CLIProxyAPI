@@ -628,21 +628,21 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	attempts := h.resolveModelAttempts(modelName)
 	isCombo := len(attempts) > 1
 	for i, attempt := range attempts {
-		if isCombo && i < len(attempts)-1 && !h.comboCandidateAvailable(modelName, i) {
+		if isCombo && i < len(attempts)-1 && !h.comboCandidateAvailable(modelName, attempt.Model) {
 			continue
 		}
 		start := time.Now()
 		resp, headers, errMsg := h.executeSingleWithAttemptTimeout(ctx, handlerType, attempt, rawJSON, alt)
 		if errMsg == nil {
 			if !attempt.IsLast && shouldFallbackMalformedToolCallResponse(rawJSON, resp) {
-				h.recordComboAttempt(modelName, i, isCombo, false, start, "malformed_tool_response")
+				h.recordComboAttempt(modelName, i, attempt.Model, isCombo, false, start, "malformed_tool_response")
 				continue
 			}
-			h.recordComboAttempt(modelName, i, isCombo, true, start, "")
+			h.recordComboAttempt(modelName, i, attempt.Model, isCombo, true, start, "")
 			return SanitizePublicResponse(resp, modelName), headers, nil
 		}
 		triggerReason := h.classifyFallbackReason(errMsg)
-		h.recordComboAttempt(modelName, i, isCombo, false, start, triggerReason)
+		h.recordComboAttempt(modelName, i, attempt.Model, isCombo, false, start, triggerReason)
 		if attempt.IsLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
 			return nil, nil, errMsg
 		}
@@ -794,17 +794,17 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	attempts := h.resolveModelAttempts(modelName)
 	isCombo := len(attempts) > 1
 	for i, attempt := range attempts {
-		if isCombo && i < len(attempts)-1 && !h.comboCandidateAvailable(modelName, i) {
+		if isCombo && i < len(attempts)-1 && !h.comboCandidateAvailable(modelName, attempt.Model) {
 			continue
 		}
 		start := time.Now()
 		resp, headers, errMsg := h.executeCountSingle(ctx, handlerType, attempt.Model, rawJSON, alt)
 		if errMsg == nil {
-			h.recordComboAttempt(modelName, i, isCombo, true, start, "")
+			h.recordComboAttempt(modelName, i, attempt.Model, isCombo, true, start, "")
 			return resp, headers, nil
 		}
 		triggerReason := h.classifyFallbackReason(errMsg)
-		h.recordComboAttempt(modelName, i, isCombo, false, start, triggerReason)
+		h.recordComboAttempt(modelName, i, attempt.Model, isCombo, false, start, triggerReason)
 		if attempt.IsLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
 			return nil, nil, errMsg
 		}
@@ -919,7 +919,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				default:
 				}
 			}
-			if i < len(attempts)-1 && !h.comboCandidateAvailable(modelName, i) {
+			if i < len(attempts)-1 && !h.comboCandidateAvailable(modelName, attempt.Model) {
 				continue
 			}
 			start := time.Now()
@@ -975,13 +975,13 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				//     (a nanosecond-wide race at exactly comboAttemptTimeout).
 				switch {
 				case idleStalled.Load():
-					h.recordComboAttempt(modelName, i, true, false, start, "idle_timeout")
+					h.recordComboAttempt(modelName, i, attempt.Model, true, false, start, "idle_timeout")
 				case bootstrapTimedOut.Load():
-					h.recordComboAttempt(modelName, i, true, false, start, "timeout")
+					h.recordComboAttempt(modelName, i, attempt.Model, true, false, start, "timeout")
 				default:
 					// Live stream owns attemptCtx for its full lifetime; it
 					// shares the parent's cancellation. Do NOT cancel here.
-					h.recordComboAttempt(modelName, i, true, true, start, "")
+					h.recordComboAttempt(modelName, i, attempt.Model, true, true, start, "")
 				}
 				return
 			}
@@ -996,7 +996,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 						StatusCode: http.StatusGatewayTimeout,
 						Error:      fmt.Errorf("combo candidate %q timed out before first byte", attempt.Model),
 					}
-					h.recordComboAttempt(modelName, i, true, false, start, "timeout")
+					h.recordComboAttempt(modelName, i, attempt.Model, true, false, start, "timeout")
 					lastErr = errMsg
 					// Watchdog only arms for non-last candidates, so there is
 					// always a later entry to try.
@@ -1012,7 +1012,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				// upstream failure so combo routing can continue instead of
 				// returning HTTP 200 with an empty body to the gateway.
 				errMsg = emptyUpstreamResponseError(attempt.Model)
-				h.recordComboAttempt(modelName, i, true, false, start, "empty_response")
+				h.recordComboAttempt(modelName, i, attempt.Model, true, false, start, "empty_response")
 				lastErr = errMsg
 				if isLast {
 					_ = sendStreamErr(ctx, errChan, errMsg)
@@ -1021,7 +1021,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				continue
 			}
 			triggerReason := h.classifyFallbackReason(errMsg)
-			h.recordComboAttempt(modelName, i, true, false, start, triggerReason)
+			h.recordComboAttempt(modelName, i, attempt.Model, true, false, start, triggerReason)
 			lastErr = errMsg
 			if isLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
 				_ = sendStreamErr(ctx, errChan, errMsg)
@@ -1811,11 +1811,11 @@ func isTransportError(body string) bool {
 // recordComboAttempt records one combo candidate outcome when a metrics
 // recorder is wired. It is a no-op for non-combo (single-attempt) requests
 // so plain model requests do not pollute the combo metrics sink.
-func (h *BaseAPIHandler) recordComboAttempt(comboName string, entryIndex int, isCombo bool, success bool, start time.Time, triggerReason string) {
+func (h *BaseAPIHandler) recordComboAttempt(comboName string, entryIndex int, candidateModel string, isCombo bool, success bool, start time.Time, triggerReason string) {
 	if !isCombo || h == nil {
 		return
 	}
-	h.recordComboCandidateHealth(comboName, entryIndex, success, triggerReason)
+	h.recordComboCandidateHealth(comboName, candidateModel, success, triggerReason)
 	if h.ComboMetrics == nil {
 		return
 	}

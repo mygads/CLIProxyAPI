@@ -1,7 +1,7 @@
 package handlers
 
 import (
-	"strconv"
+	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/resilience"
@@ -35,22 +35,22 @@ func newDefaultComboCandidateCooldownRegistry() *comboCandidateCooldownRegistry 
 	})
 }
 
-func comboCandidateKey(comboName string, entryIndex int) string {
-	return comboName + "#" + strconv.Itoa(entryIndex)
+func comboCandidateKey(comboName, candidateModel string) string {
+	return strings.ToLower(strings.TrimSpace(comboName)) + "#" + strings.ToLower(strings.TrimSpace(candidateModel))
 }
 
-func (r *comboCandidateCooldownRegistry) allow(comboName string, entryIndex int) bool {
-	if r == nil || r.breakers == nil || comboName == "" || entryIndex < 0 {
+func (r *comboCandidateCooldownRegistry) allow(comboName, candidateModel string) bool {
+	if r == nil || r.breakers == nil || comboName == "" || candidateModel == "" {
 		return true
 	}
-	return r.breakers.Allow(comboCandidateKey(comboName, entryIndex), "api_key")
+	return r.breakers.Allow(comboCandidateKey(comboName, candidateModel), "api_key")
 }
 
-func (r *comboCandidateCooldownRegistry) record(comboName string, entryIndex int, success bool, triggerReason string) {
-	if r == nil || r.breakers == nil || comboName == "" || entryIndex < 0 {
+func (r *comboCandidateCooldownRegistry) record(comboName, candidateModel string, success bool, triggerReason string) {
+	if r == nil || r.breakers == nil || comboName == "" || candidateModel == "" {
 		return
 	}
-	key := comboCandidateKey(comboName, entryIndex)
+	key := comboCandidateKey(comboName, candidateModel)
 	if success {
 		r.breakers.RecordSuccess(key, "api_key")
 		return
@@ -60,18 +60,18 @@ func (r *comboCandidateCooldownRegistry) record(comboName string, entryIndex int
 	}
 }
 
-func (h *BaseAPIHandler) comboCandidateAvailable(comboName string, entryIndex int) bool {
+func (h *BaseAPIHandler) comboCandidateAvailable(comboName, candidateModel string) bool {
 	if h == nil || h.comboCooldowns == nil {
 		return true
 	}
-	return h.comboCooldowns.allow(comboName, entryIndex)
+	return h.comboCooldowns.allow(comboName, candidateModel)
 }
 
-func (h *BaseAPIHandler) recordComboCandidateHealth(comboName string, entryIndex int, success bool, triggerReason string) {
+func (h *BaseAPIHandler) recordComboCandidateHealth(comboName, candidateModel string, success bool, triggerReason string) {
 	if h == nil || h.comboCooldowns == nil {
 		return
 	}
-	h.comboCooldowns.record(comboName, entryIndex, success, triggerReason)
+	h.comboCooldowns.record(comboName, candidateModel, success, triggerReason)
 }
 
 // Clear client-payload failures must not poison provider health. Everything
