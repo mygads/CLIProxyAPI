@@ -569,3 +569,69 @@ func publicChunkHasVisibleContent(chunk []byte) bool {
 	}
 	return payloadHasVisiblePublicContent(payload)
 }
+
+// publicChunkHasCompletionProgress reports whether a buffered stream has
+// produced output that makes it unsafe to switch to another combo candidate.
+// Provider streams commonly start with role/response-created metadata and can
+// then stall without ever producing text. Those prelude frames are valid SSE,
+// but they are not a completion and must not commit combo routing by
+// themselves.
+func publicChunkHasCompletionProgress(chunk []byte) bool {
+	trimmed := bytes.TrimSpace(chunk)
+	if len(trimmed) == 0 {
+		return false
+	}
+	if looksLikeSSEChunk(trimmed) {
+		for _, event := range extractSSEDataEvents(trimmed) {
+			var payload any
+			if json.Unmarshal(event, &payload) == nil && payloadHasCompletionProgress(payload) {
+				return true
+			}
+		}
+		return false
+	}
+	if !json.Valid(trimmed) {
+		// Plain-text provider output is already user-visible completion data.
+		return true
+	}
+	var payload any
+	if json.Unmarshal(trimmed, &payload) != nil {
+		return true
+	}
+	return payloadHasCompletionProgress(payload)
+}
+
+func payloadHasCompletionProgress(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, nested := range typed {
+			switch strings.ToLower(key) {
+			case "content", "text", "delta", "reasoning_content", "reasoning", "thinking", "arguments", "b64_json", "image_url", "audio":
+				if current, ok := nested.(string); ok && strings.TrimSpace(current) != "" {
+					return true
+				}
+			case "tool_calls", "function_call":
+				if nested != nil {
+					return true
+				}
+			case "type":
+				if current, ok := nested.(string); ok {
+					switch strings.ToLower(strings.TrimSpace(current)) {
+					case "tool_use", "function_call":
+						return true
+					}
+				}
+			}
+			if payloadHasCompletionProgress(nested) {
+				return true
+			}
+		}
+	case []any:
+		for _, nested := range typed {
+			if payloadHasCompletionProgress(nested) {
+				return true
+			}
+		}
+	}
+	return false
+}

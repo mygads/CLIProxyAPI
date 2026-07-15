@@ -1129,6 +1129,8 @@ func forwardStreamAttemptOnCommit(
 	}()
 
 	committed := false
+	var pendingChunks [][]byte
+	var pendingPayload []byte
 	for subData != nil || subErr != nil {
 		select {
 		case <-doneCh(ctx):
@@ -1142,11 +1144,36 @@ func forwardStreamAttemptOnCommit(
 			if len(safe) == 0 || !publicChunkHasVisibleContent(safe) {
 				continue
 			}
-			if !committed && onCommit != nil {
-				onCommit()
-				armIdle()
+			if !committed {
+				pendingChunks = append(pendingChunks, safe)
+				trimmedSafe := bytes.TrimSpace(safe)
+				if len(pendingPayload) > 0 && !bytes.HasSuffix(pendingPayload, []byte("\n")) &&
+					(bytes.HasPrefix(trimmedSafe, []byte("data:")) || bytes.HasPrefix(trimmedSafe, []byte("event:"))) {
+					// Executors usually deliver one complete SSE event per chunk,
+					// but not all include the trailing blank line. Keep adjacent
+					// complete events separable for progress inspection while still
+					// allowing genuinely fragmented events to concatenate verbatim.
+					pendingPayload = append(pendingPayload, '\n', '\n')
+				}
+				pendingPayload = append(pendingPayload, safe...)
+				if !publicChunkHasCompletionProgress(pendingPayload) {
+					continue
+				}
+				if onCommit != nil {
+					onCommit()
+					armIdle()
+				}
+				committed = true
+				resetIdle()
+				for _, pending := range pendingChunks {
+					if !sendStreamData(ctx, dataChan, pending) {
+						return committed, nil
+					}
+				}
+				pendingChunks = nil
+				pendingPayload = nil
+				continue
 			}
-			committed = true
 			resetIdle()
 			if !sendStreamData(ctx, dataChan, safe) {
 				return committed, nil

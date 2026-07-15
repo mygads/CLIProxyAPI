@@ -24,8 +24,16 @@ func (e *emptyResponseFallbackExecutor) Execute(_ context.Context, _ *coreauth.A
 }
 
 func (e *emptyResponseFallbackExecutor) ExecuteStream(_ context.Context, _ *coreauth.Auth, req coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
-	chunks := make(chan coreexecutor.StreamChunk, 1)
-	if strings.Contains(req.Model, "empty") {
+	chunks := make(chan coreexecutor.StreamChunk, 2)
+	if strings.Contains(req.Model, "role-then-content") {
+		chunks <- coreexecutor.StreamChunk{Payload: []byte(`data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null,"index":0}]}`)}
+		chunks <- coreexecutor.StreamChunk{Payload: []byte(`data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null,"index":0}]}`)}
+	} else if strings.Contains(req.Model, "role-only") {
+		// A provider may emit its opening role frame and then close or stall.
+		// This is protocol metadata, not usable completion output, so it must
+		// not commit the combo to this candidate.
+		chunks <- coreexecutor.StreamChunk{Payload: []byte(`data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null,"index":0}]}`)}
+	} else if strings.Contains(req.Model, "empty") {
 		// A whitespace payload passes the auth manager's raw bootstrap gate,
 		// then is removed by the public stream sanitizer. This reproduces the
 		// production HTTP-200-with-empty-body failure mode.
@@ -134,6 +142,61 @@ func TestExecuteWithAuthManager_EmptyResponseFallsThrough(t *testing.T) {
 		t.Fatalf("expected fallback payload, got %q", resp)
 	}
 	if len(metrics.records) != 2 || metrics.records[0].success || !metrics.records[1].success {
+		t.Fatalf("unexpected metrics: %+v", metrics.records)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_TwoContentlessCandidatesFallThroughToThird(t *testing.T) {
+	handler, metrics := newEmptyResponseFallbackHandler(t, []ComboCandidate{
+		{Model: "metaprov/role-only"},
+		{Model: "emptyprov/empty"},
+		{Model: "fastprov/fast", IsLast: true},
+	})
+
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "combo-empty", []byte(`{"model":"combo-empty","messages":[{"role":"user","content":"hi"}],"stream":true}`), "")
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	for errMsg := range errChan {
+		if errMsg != nil {
+			t.Fatalf("expected third candidate to succeed, got error: %+v", errMsg)
+		}
+	}
+	if !strings.Contains(string(got), "ok") {
+		t.Fatalf("expected third-candidate payload, got %q", got)
+	}
+	if strings.Contains(string(got), `"role":"assistant"`) {
+		t.Fatalf("contentless prelude from failed candidate leaked downstream: %q", got)
+	}
+	if len(metrics.records) != 3 || metrics.records[0].success || metrics.records[1].success || !metrics.records[2].success {
+		t.Fatalf("unexpected metrics: %+v", metrics.records)
+	}
+	if metrics.records[0].triggerReason != "empty_response" || metrics.records[1].triggerReason != "empty_response" {
+		t.Fatalf("expected both contentless candidates to be classified empty_response: %+v", metrics.records)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_PreludeIsReleasedWithRealContent(t *testing.T) {
+	handler, metrics := newEmptyResponseFallbackHandler(t, []ComboCandidate{
+		{Model: "metaprov/role-then-content"},
+		{Model: "fastprov/fast", IsLast: true},
+	})
+
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "combo-empty", []byte(`{"model":"combo-empty","messages":[{"role":"user","content":"hi"}],"stream":true}`), "")
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	for errMsg := range errChan {
+		if errMsg != nil {
+			t.Fatalf("expected first candidate to succeed, got error: %+v", errMsg)
+		}
+	}
+	if !strings.Contains(string(got), `"role":"assistant"`) || !strings.Contains(string(got), `"content":"ok"`) {
+		t.Fatalf("expected buffered prelude and content, got %q", got)
+	}
+	if len(metrics.records) != 1 || !metrics.records[0].success {
 		t.Fatalf("unexpected metrics: %+v", metrics.records)
 	}
 }
