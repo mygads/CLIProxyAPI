@@ -72,6 +72,19 @@ func TestComboCandidateCooldownIgnoresBadRequest(t *testing.T) {
 	}
 }
 
+func TestComboCandidateCooldownIgnoresClientCancellation(t *testing.T) {
+	r := newComboCandidateCooldownRegistry(resilience.Config{
+		FailureThreshold:     1,
+		ResetAfter:           time.Minute,
+		HalfOpenProbeSuccess: 1,
+	})
+
+	r.record("combo-client-cancel", "server3/model", false, "client_canceled")
+	if !r.allow("combo-client-cancel", "server3/model") {
+		t.Fatal("client cancellation must not cool down a provider candidate")
+	}
+}
+
 func TestRecordComboAttemptFeedsHandlerCooldown(t *testing.T) {
 	h := NewBaseAPIHandlers(nil, nil)
 	for i := 0; i < comboCandidateFailureThreshold; i++ {

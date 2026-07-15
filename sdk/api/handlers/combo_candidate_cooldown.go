@@ -78,5 +78,5 @@ func (h *BaseAPIHandler) recordComboCandidateHealth(comboName, candidateModel st
 // else recorded by the combo path means that this candidate could not provide
 // a usable response and should contribute to its cooldown.
 func comboFailureCountsForCooldown(triggerReason string) bool {
-	return triggerReason != "" && triggerReason != "bad_request"
+	return triggerReason != "" && triggerReason != "bad_request" && triggerReason != "client_canceled"
 }

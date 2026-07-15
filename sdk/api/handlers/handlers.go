@@ -668,6 +668,12 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 			return SanitizePublicResponse(resp, modelName), headers, nil
 		}
 		triggerReason := h.classifyFallbackReason(errMsg)
+		if ctx != nil && ctx.Err() != nil {
+			// A downstream client deadline/disconnect says nothing about the
+			// provider's health. Do not poison its combo cooldown or continue
+			// fallback work after the caller has gone away.
+			return nil, nil, errMsg
+		}
 		h.recordComboAttempt(modelName, i, attempt.Model, isCombo, false, start, triggerReason)
 		if attempt.IsLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
 			return nil, nil, errMsg
@@ -837,6 +843,9 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 			return resp, headers, nil
 		}
 		triggerReason := h.classifyFallbackReason(errMsg)
+		if ctx != nil && ctx.Err() != nil {
+			return nil, nil, errMsg
+		}
 		h.recordComboAttempt(modelName, i, attempt.Model, isCombo, false, start, triggerReason)
 		if attempt.IsLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
 			return nil, nil, errMsg
@@ -1059,6 +1068,11 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				continue
 			}
 			triggerReason := h.classifyFallbackReason(errMsg)
+			if ctx != nil && ctx.Err() != nil {
+				// Parent cancellation is a client-side outcome, not evidence that
+				// this combo candidate is unhealthy.
+				return
+			}
 			h.recordComboAttempt(modelName, i, attempt.Model, true, false, start, triggerReason)
 			lastErr = errMsg
 			if isLast || !comboShouldFallback(errMsg, attempt.TriggerOn) {
