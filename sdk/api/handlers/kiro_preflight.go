@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strings"
@@ -24,6 +25,8 @@ var kiroToolNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 type kiroCompatibilityIssue struct {
 	Reason          string
+	Detail          string
+	ToolName        string
 	MessageCount    int
 	ToolCount       int
 	ToolNamesSample []string
@@ -61,7 +64,7 @@ func kiroPayloadCompatibilityIssue(rawJSON []byte) *kiroCompatibilityIssue {
 
 	tools, _ := payload["tools"].([]any)
 	issue.ToolCount = len(tools)
-	declared := make(map[string]struct{}, len(tools))
+	declared := make(map[string]map[string]any, len(tools))
 	allSchemaBytes := 0
 	for _, rawTool := range tools {
 		tool, ok := rawTool.(map[string]any)
@@ -92,14 +95,15 @@ func kiroPayloadCompatibilityIssue(rawJSON []byte) *kiroCompatibilityIssue {
 			issue.Reason = "duplicate_tool_name"
 			return issue
 		}
-		declared[name] = struct{}{}
 
 		schema := definition["parameters"]
 		if schema == nil {
 			schema = definition["input_schema"]
 		}
+		var schemaObject map[string]any
 		if schema != nil {
-			schemaObject, ok := schema.(map[string]any)
+			var ok bool
+			schemaObject, ok = schema.(map[string]any)
 			if !ok {
 				issue.Reason = "invalid_tool_schema"
 				return issue
@@ -115,6 +119,7 @@ func kiroPayloadCompatibilityIssue(rawJSON []byte) *kiroCompatibilityIssue {
 			}
 			allSchemaBytes += len(encoded)
 		}
+		declared[name] = schemaObject
 	}
 	sort.Strings(issue.ToolNamesSample)
 	if len(issue.ToolNamesSample) > 8 {
@@ -144,20 +149,27 @@ func kiroPayloadCompatibilityIssue(rawJSON []byte) *kiroCompatibilityIssue {
 		if _, duplicate := calls[id]; duplicate {
 			return "duplicate_tool_call_id"
 		}
-		if _, ok := declared[name]; !ok || name == "" {
+		schema, ok := declared[name]
+		if !ok || name == "" {
 			return "undeclared_tool_call"
 		}
+		args := map[string]any{}
 		if arguments != nil {
 			switch typed := arguments.(type) {
 			case string:
-				var object map[string]any
-				if strings.TrimSpace(typed) == "" || json.Unmarshal([]byte(typed), &object) != nil || object == nil {
+				if strings.TrimSpace(typed) == "" || json.Unmarshal([]byte(typed), &args) != nil || args == nil {
 					return "invalid_tool_arguments"
 				}
 			case map[string]any:
+				args = typed
 			default:
 				return "invalid_tool_arguments"
 			}
+		}
+		if err := validateKiroToolArguments(args, schema, "arguments"); err != nil {
+			issue.ToolName = name
+			issue.Detail = err.Error()
+			return "tool_arguments_schema_mismatch"
 		}
 		calls[id] = &callState{name: name, messageNo: messageNo}
 		return ""
@@ -219,6 +231,126 @@ func kiroPayloadCompatibilityIssue(rawJSON []byte) *kiroCompatibilityIssue {
 		}
 	}
 	return nil
+}
+
+func validateKiroToolArguments(value any, schema map[string]any, path string) error {
+	if len(schema) == 0 {
+		return nil
+	}
+	if enumValues, ok := schema["enum"].([]any); ok && len(enumValues) > 0 {
+		matched := false
+		for _, candidate := range enumValues {
+			if fmt.Sprint(candidate) == fmt.Sprint(value) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return fmt.Errorf("%s is not an allowed enum value", path)
+		}
+	}
+	if types := kiroSchemaTypes(schema["type"]); len(types) > 0 {
+		matched := false
+		for _, expected := range types {
+			if kiroValueMatchesType(value, expected) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return fmt.Errorf("%s has the wrong JSON type", path)
+		}
+	}
+	if object, ok := value.(map[string]any); ok {
+		if required, ok := schema["required"].([]any); ok {
+			for _, rawName := range required {
+				name, _ := rawName.(string)
+				if name != "" {
+					if _, exists := object[name]; !exists {
+						return fmt.Errorf("%s.%s is required", path, name)
+					}
+				}
+			}
+		}
+		properties, _ := schema["properties"].(map[string]any)
+		for name, child := range object {
+			rawChildSchema, declared := properties[name]
+			if !declared {
+				if allow, ok := schema["additionalProperties"].(bool); ok && !allow {
+					return fmt.Errorf("%s.%s is not declared", path, name)
+				}
+				continue
+			}
+			childSchema, _ := rawChildSchema.(map[string]any)
+			if err := validateKiroToolArguments(child, childSchema, path+"."+name); err != nil {
+				return err
+			}
+		}
+	}
+	if array, ok := value.([]any); ok {
+		if itemSchema, ok := schema["items"].(map[string]any); ok {
+			for i, item := range array {
+				if err := validateKiroToolArguments(item, itemSchema, fmt.Sprintf("%s[%d]", path, i)); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func kiroSchemaTypes(raw any) []string {
+	switch typed := raw.(type) {
+	case string:
+		return []string{typed}
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text, ok := item.(string); ok && text != "" {
+				out = append(out, text)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func kiroValueMatchesType(value any, expected string) bool {
+	switch expected {
+	case "object":
+		_, ok := value.(map[string]any)
+		return ok
+	case "array":
+		_, ok := value.([]any)
+		return ok
+	case "string":
+		_, ok := value.(string)
+		return ok
+	case "boolean":
+		_, ok := value.(bool)
+		return ok
+	case "number":
+		switch value.(type) {
+		case json.Number, float64, float32, int, int32, int64:
+			return true
+		}
+	case "integer":
+		switch number := value.(type) {
+		case json.Number:
+			_, err := number.Int64()
+			return err == nil
+		case float64:
+			return math.Trunc(number) == number
+		case float32:
+			return float32(math.Trunc(float64(number))) == number
+		case int, int32, int64:
+			return true
+		}
+	case "null":
+		return value == nil
+	}
+	return false
 }
 
 func textField(object map[string]any, key string) string {

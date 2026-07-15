@@ -2046,6 +2046,8 @@ func (h *BaseAPIHandler) recordIncompatiblePayloadSkip(ctx context.Context, comb
 		"candidate_model":        candidateModel,
 		"routing_reason":         "incompatible_payload",
 		"incompatibility_reason": issue.Reason,
+		"incompatibility_detail": issue.Detail,
+		"tool_name":              issue.ToolName,
 		"message_count":          issue.MessageCount,
 		"tool_count":             issue.ToolCount,
 		"tool_names_sample":      issue.ToolNamesSample,

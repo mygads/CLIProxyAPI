@@ -88,6 +88,19 @@ func TestKiroPayloadCompatibilityKnownProductionLimits(t *testing.T) {
 	}
 }
 
+func TestKiroPayloadCompatibilityRejectsHistoricalSchemaMismatch(t *testing.T) {
+	raw := []byte(`{
+      "tools":[{"name":"Glob","input_schema":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}}],
+      "messages":[
+        {"role":"assistant","content":[{"type":"tool_use","id":"toolu_bad","name":"Glob","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bad","is_error":true,"content":"pattern is required"}]}
+      ]}`)
+	issue := kiroPayloadCompatibilityIssue(raw)
+	if issue == nil || issue.Reason != "tool_arguments_schema_mismatch" || issue.ToolName != "Glob" || issue.Detail != "arguments.pattern is required" {
+		t.Fatalf("issue=%+v", issue)
+	}
+}
+
 func TestKiroPayloadCompatibilityRejectsToolShapesKiroCannotRepresent(t *testing.T) {
 	tests := []struct {
 		name   string
