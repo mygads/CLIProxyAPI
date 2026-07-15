@@ -51,10 +51,17 @@ func GinLogrusLogger() gin.HandlerFunc {
 		// Only generate request ID for AI API paths
 		var requestID string
 		if isAIAPIPath(path) {
-			requestID = GenerateRequestID()
+			// Preserve the edge-generated ID so Gateway ledger rows, CLIProxy
+			// combo decisions, and provider errors share one correlation key.
+			// Cap length to prevent untrusted headers from bloating logs.
+			requestID = strings.TrimSpace(c.GetHeader("X-Request-ID"))
+			if requestID == "" || len(requestID) > 128 {
+				requestID = GenerateRequestID()
+			}
 			SetGinRequestID(c, requestID)
 			ctx := WithRequestID(c.Request.Context(), requestID)
 			c.Request = c.Request.WithContext(ctx)
+			c.Header("X-Request-ID", requestID)
 		}
 
 		c.Next()

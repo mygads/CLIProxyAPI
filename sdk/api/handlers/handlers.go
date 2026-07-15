@@ -24,6 +24,7 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/net/context"
 )
@@ -653,7 +654,15 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		attempts = imgAttempts
 	}
 	isCombo := len(attempts) > 1
+	var lastIncompatible error
 	for i, attempt := range attempts {
+		if isKiroServer3Candidate(attempt.Model) {
+			if issue := kiroPayloadCompatibilityIssue(rawJSON); issue != nil {
+				lastIncompatible = incompatibleKiroPayloadError(attempt.Model, issue.Reason)
+				h.recordIncompatiblePayloadSkip(ctx, modelName, i, attempt.Model, isCombo, issue)
+				continue
+			}
+		}
 		if isCombo && i < len(attempts)-1 && !h.comboCandidateAvailable(modelName, attempt.Model) {
 			continue
 		}
@@ -679,6 +688,9 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 			return nil, nil, errMsg
 		}
 		// Otherwise loop to the next candidate.
+	}
+	if lastIncompatible != nil {
+		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusUnprocessableEntity, Error: lastIncompatible}
 	}
 	// resolveModelAttempts always returns at least one entry (the original
 	// model), so we never reach here; keep the fall-through to satisfy the
@@ -940,6 +952,17 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		if len(attempts) == 1 {
 			target = attempts[0].Model
 		}
+		if isKiroServer3Candidate(target) {
+			if issue := kiroPayloadCompatibilityIssue(rawJSON); issue != nil {
+				h.recordIncompatiblePayloadSkip(ctx, modelName, 0, target, false, issue)
+				dataChan := make(chan []byte)
+				errChan := make(chan *interfaces.ErrorMessage, 1)
+				close(dataChan)
+				errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusUnprocessableEntity, Error: incompatibleKiroPayloadError(target, issue.Reason)}
+				close(errChan)
+				return dataChan, nil, errChan
+			}
+		}
 		data, headers, errs := h.executeStreamSingle(ctx, handlerType, target, rawJSON, alt)
 		return sanitizePublicStream(data, modelName), headers, errs
 	}
@@ -964,6 +987,13 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				case <-ctx.Done():
 					return
 				default:
+				}
+			}
+			if isKiroServer3Candidate(attempt.Model) {
+				if issue := kiroPayloadCompatibilityIssue(rawJSON); issue != nil {
+					h.recordIncompatiblePayloadSkip(ctx, modelName, i, attempt.Model, true, issue)
+					lastErr = &interfaces.ErrorMessage{StatusCode: http.StatusUnprocessableEntity, Error: incompatibleKiroPayloadError(attempt.Model, issue.Reason)}
+					continue
 				}
 			}
 			if i < len(attempts)-1 && !h.comboCandidateAvailable(modelName, attempt.Model) {
@@ -2000,6 +2030,29 @@ func (h *BaseAPIHandler) recordComboAttempt(comboName string, entryIndex int, ca
 		return
 	}
 	h.ComboMetrics.Record(comboName, entryIndex, success, time.Since(start), triggerReason)
+}
+
+// recordIncompatiblePayloadSkip records a routing decision, not a provider
+// failure. In particular it must not call recordComboCandidateHealth: a valid
+// OpenAI payload that Kiro cannot represent says nothing about server3 health
+// and must never trigger cooldown.
+func (h *BaseAPIHandler) recordIncompatiblePayloadSkip(ctx context.Context, comboName string, entryIndex int, candidateModel string, isCombo bool, issue *kiroCompatibilityIssue) {
+	if issue == nil {
+		return
+	}
+	log.WithFields(log.Fields{
+		"request_id":             logging.GetRequestID(ctx),
+		"combo":                  comboName,
+		"candidate_model":        candidateModel,
+		"routing_reason":         "incompatible_payload",
+		"incompatibility_reason": issue.Reason,
+		"message_count":          issue.MessageCount,
+		"tool_count":             issue.ToolCount,
+		"tool_names_sample":      issue.ToolNamesSample,
+	}).Info("skipping Kiro candidate during compatibility preflight")
+	if isCombo && h != nil && h.ComboMetrics != nil {
+		h.ComboMetrics.Record(comboName, entryIndex, false, 0, "incompatible_payload")
+	}
 }
 
 // classifyFallbackReason returns a short trigger reason for a failed combo
