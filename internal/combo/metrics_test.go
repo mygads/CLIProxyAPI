@@ -88,6 +88,40 @@ func TestMetrics_Reset(t *testing.T) {
 	}
 }
 
+func TestRegistryUpsertResetsIndexMetricsOnReplacement(t *testing.T) {
+	r := NewRegistry()
+	first := &Combo{
+		Name:   "reordered",
+		Status: StatusActive,
+		Entries: []Entry{
+			{Priority: 0, Model: "server3/kr/auto"},
+			{Priority: 1, Model: "mk/mk/auto"},
+		},
+	}
+	if err := r.Upsert(first); err != nil {
+		t.Fatal(err)
+	}
+	r.Metrics().Record(first.Name, 0, false, 0, "incompatible_payload")
+	if got := r.Metrics().Snapshot(first.Name, 0).TotalRequests; got != 1 {
+		t.Fatalf("precondition total=%d", got)
+	}
+
+	reordered := &Combo{
+		Name:   first.Name,
+		Status: StatusActive,
+		Entries: []Entry{
+			{Priority: 0, Model: "mk/mk/auto"},
+			{Priority: 1, Model: "server3/kr/auto"},
+		},
+	}
+	if err := r.Upsert(reordered); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Metrics().Snapshot(first.Name, 0).TotalRequests; got != 0 {
+		t.Fatalf("stale metrics survived combo replacement: total=%d", got)
+	}
+}
+
 func TestMetrics_CapSamples(t *testing.T) {
 	m := NewMetricsRegistry()
 	for i := 0; i < MaxSamplesPerEntry*2; i++ {

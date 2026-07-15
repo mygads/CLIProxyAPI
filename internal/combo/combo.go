@@ -196,8 +196,17 @@ func (r *Registry) Upsert(combo *Combo) error {
 	clone.UpdatedAt = time.Now().UTC()
 
 	r.mu.Lock()
+	_, replacing := r.entries[key]
 	r.entries[key] = &clone
+	metrics := r.metrics
 	r.mu.Unlock()
+	// Metrics are keyed by entry index. Keeping samples after an operator
+	// reorders/replaces a combo attributes the old provider's failures to the
+	// new provider now occupying that index. Reset only on replacement; first
+	// load/create has no historical mapping to invalidate.
+	if replacing && metrics != nil {
+		metrics.Reset(clone.Name)
+	}
 	return nil
 }
 
