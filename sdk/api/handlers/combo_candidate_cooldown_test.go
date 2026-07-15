@@ -35,6 +35,30 @@ func TestComboCandidateCooldownTripsAndRecovers(t *testing.T) {
 	}
 }
 
+func TestDefaultComboCandidateCooldownConfig(t *testing.T) {
+	r := newDefaultComboCandidateCooldownRegistry()
+	comboName := "combo-defaults"
+	candidateModel := "server3/model"
+
+	for i := 0; i < comboCandidateFailureThreshold; i++ {
+		r.record(comboName, candidateModel, false, "upstream_unavailable")
+	}
+
+	snapshot, ok := r.breakers.Snapshots()[comboCandidateKey(comboName, candidateModel)]
+	if !ok {
+		t.Fatal("default cooldown breaker snapshot was not created")
+	}
+	if snapshot.Config.FailureThreshold != 3 {
+		t.Fatalf("failure threshold = %d, want 3", snapshot.Config.FailureThreshold)
+	}
+	if snapshot.Config.ResetAfter != time.Minute {
+		t.Fatalf("reset duration = %s, want 1m", snapshot.Config.ResetAfter)
+	}
+	if snapshot.State != resilience.StateOpen {
+		t.Fatalf("breaker state = %s, want OPEN", snapshot.State)
+	}
+}
+
 func TestComboCandidateCooldownIgnoresBadRequest(t *testing.T) {
 	r := newComboCandidateCooldownRegistry(resilience.Config{
 		FailureThreshold:     1,

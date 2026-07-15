@@ -9,7 +9,7 @@ import (
 
 const (
 	comboCandidateFailureThreshold = 3
-	comboCandidateResetAfter       = 2 * time.Minute
+	comboCandidateResetAfter       = time.Minute
 )
 
 // comboCandidateCooldownRegistry is a circuit breaker for failures detected
