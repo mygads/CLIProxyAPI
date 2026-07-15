@@ -1,0 +1,64 @@
+package handlers
+
+import (
+	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/resilience"
+)
+
+func TestComboCandidateCooldownTripsAndRecovers(t *testing.T) {
+	r := newComboCandidateCooldownRegistry(resilience.Config{
+		FailureThreshold:     3,
+		ResetAfter:           5 * time.Millisecond,
+		HalfOpenProbeSuccess: 1,
+	})
+
+	for i := 0; i < 2; i++ {
+		r.record("combo-test", 0, false, "empty_response")
+		if !r.allow("combo-test", 0) {
+			t.Fatalf("candidate blocked after only %d failures", i+1)
+		}
+	}
+	r.record("combo-test", 0, false, "empty_response")
+	if r.allow("combo-test", 0) {
+		t.Fatal("candidate allowed after reaching failure threshold")
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	if !r.allow("combo-test", 0) {
+		t.Fatal("candidate did not allow a half-open probe after cooldown")
+	}
+	r.record("combo-test", 0, true, "")
+	if !r.allow("combo-test", 0) {
+		t.Fatal("successful probe did not close candidate breaker")
+	}
+}
+
+func TestComboCandidateCooldownIgnoresBadRequest(t *testing.T) {
+	r := newComboCandidateCooldownRegistry(resilience.Config{
+		FailureThreshold:     1,
+		ResetAfter:           time.Hour,
+		HalfOpenProbeSuccess: 1,
+	})
+
+	r.record("combo-client-error", 0, false, "bad_request")
+	if !r.allow("combo-client-error", 0) {
+		t.Fatal("client bad_request incorrectly opened provider cooldown")
+	}
+}
+
+func TestRecordComboAttemptFeedsHandlerCooldown(t *testing.T) {
+	h := NewBaseAPIHandlers(nil, nil)
+	for i := 0; i < comboCandidateFailureThreshold; i++ {
+		h.recordComboAttempt("combo-handler-wiring", 0, true, false, time.Now(), "upstream_unavailable")
+	}
+	if h.comboCandidateAvailable("combo-handler-wiring", 0) {
+		t.Fatal("handler still considers candidate available after repeated recorded failures")
+	}
+	// The final entry is deliberately exempted by the loop itself, not by the
+	// registry, so a chain always makes at least one real upstream attempt.
+	if !h.comboCandidateAvailable("combo-handler-wiring", 1) {
+		t.Fatal("unfailed next candidate should remain available")
+	}
+}

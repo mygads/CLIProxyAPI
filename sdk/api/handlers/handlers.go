@@ -370,6 +370,10 @@ type BaseAPIHandler struct {
 	// recorded so operators can inspect success/failure/latency via the
 	// management metrics endpoint.
 	ComboMetrics ComboMetricsRecorder
+
+	// comboCooldowns tracks failures that only become visible after the auth
+	// executor has returned (for example a stream with no visible content).
+	comboCooldowns *comboCandidateCooldownRegistry
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.
@@ -383,8 +387,9 @@ type BaseAPIHandler struct {
 //   - *BaseAPIHandler: A new API handlers instance
 func NewBaseAPIHandlers(cfg *config.SDKConfig, authManager *coreauth.Manager) *BaseAPIHandler {
 	return &BaseAPIHandler{
-		Cfg:         cfg,
-		AuthManager: authManager,
+		Cfg:            cfg,
+		AuthManager:    authManager,
+		comboCooldowns: newDefaultComboCandidateCooldownRegistry(),
 	}
 }
 
@@ -623,6 +628,9 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	attempts := h.resolveModelAttempts(modelName)
 	isCombo := len(attempts) > 1
 	for i, attempt := range attempts {
+		if isCombo && i < len(attempts)-1 && !h.comboCandidateAvailable(modelName, i) {
+			continue
+		}
 		start := time.Now()
 		resp, headers, errMsg := h.executeSingleWithAttemptTimeout(ctx, handlerType, attempt, rawJSON, alt)
 		if errMsg == nil {
@@ -786,6 +794,9 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	attempts := h.resolveModelAttempts(modelName)
 	isCombo := len(attempts) > 1
 	for i, attempt := range attempts {
+		if isCombo && i < len(attempts)-1 && !h.comboCandidateAvailable(modelName, i) {
+			continue
+		}
 		start := time.Now()
 		resp, headers, errMsg := h.executeCountSingle(ctx, handlerType, attempt.Model, rawJSON, alt)
 		if errMsg == nil {
@@ -907,6 +918,9 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 					return
 				default:
 				}
+			}
+			if i < len(attempts)-1 && !h.comboCandidateAvailable(modelName, i) {
+				continue
 			}
 			start := time.Now()
 			isLast := attempt.IsLast || i == len(attempts)-1
@@ -1798,7 +1812,11 @@ func isTransportError(body string) bool {
 // recorder is wired. It is a no-op for non-combo (single-attempt) requests
 // so plain model requests do not pollute the combo metrics sink.
 func (h *BaseAPIHandler) recordComboAttempt(comboName string, entryIndex int, isCombo bool, success bool, start time.Time, triggerReason string) {
-	if !isCombo || h == nil || h.ComboMetrics == nil {
+	if !isCombo || h == nil {
+		return
+	}
+	h.recordComboCandidateHealth(comboName, entryIndex, success, triggerReason)
+	if h.ComboMetrics == nil {
 		return
 	}
 	h.ComboMetrics.Record(comboName, entryIndex, success, time.Since(start), triggerReason)
