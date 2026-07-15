@@ -21,6 +21,9 @@
       - ./static:/data/cliproxy/objectstore/objectstore/config/static
       - ./auths:/data/cliproxy/objectstore/objectstore/auths
     restart: unless-stopped
+    # Keep Docker from sending SIGKILL while the application drains provider
+    # requests that can legitimately spend up to 120 seconds thinking.
+    stop_grace_period: 140s
     networks:
       - genfity-network
 

@@ -29,6 +29,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// gracefulShutdownTimeout is intentionally longer than the maximum provider
+// bootstrap window. During a deployment, in-flight thinking requests must be
+// allowed to finish before provider clients and background services are closed.
+const gracefulShutdownTimeout = 130 * time.Second
+
 // Service wraps the proxy server lifecycle so external programs can embed the CLI proxy.
 // It manages the complete lifecycle including authentication, file watching, HTTP server,
 // and integration with various AI service providers.
@@ -771,7 +776,7 @@ func (s *Service) Run(ctx context.Context) error {
 		redisqueue.SetUsageStatisticsEnabled(true)
 	}
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
 	defer shutdownCancel()
 	defer func() {
 		if err := s.Shutdown(shutdownCtx); err != nil {
@@ -969,6 +974,19 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			ctx = context.Background()
 		}
 
+		// Stop accepting new HTTP requests and drain in-flight requests while all
+		// provider dependencies are still available. Closing the home client or
+		// auth manager first can turn an otherwise healthy in-flight request into
+		// an empty_upstream_response during a container replacement.
+		if s.server != nil {
+			shutdownCtx, cancel := context.WithTimeout(ctx, gracefulShutdownTimeout)
+			defer cancel()
+			if err := s.server.Stop(shutdownCtx); err != nil {
+				log.Errorf("error stopping API server: %v", err)
+				shutdownErr = err
+			}
+		}
+
 		if s.homeCancel != nil {
 			s.homeCancel()
 			s.homeCancel = nil
@@ -1014,17 +1032,6 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 
 		// no legacy clients to persist
-
-		if s.server != nil {
-			shutdownCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-			if err := s.server.Stop(shutdownCtx); err != nil {
-				log.Errorf("error stopping API server: %v", err)
-				if shutdownErr == nil {
-					shutdownErr = err
-				}
-			}
-		}
 
 		usage.StopDefault()
 	})
