@@ -502,7 +502,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 	// → HTTP 524 to the client).
 	setSSEHeaders()
 	c.Status(http.StatusOK)
-	_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+	_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", handlers.OpenAIStreamHeartbeat(modelName))
 	flusher.Flush()
 
 	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
@@ -533,7 +533,7 @@ bootstrapLoop:
 			cliCancel(c.Request.Context().Err())
 			return
 		case <-bootstrapTicker.C:
-			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", handlers.OpenAIStreamHeartbeat(modelName))
 			flusher.Flush()
 		case res := <-bootstrap:
 			dataChan = res.dataChan
@@ -555,7 +555,7 @@ bootstrapLoop:
 			cliCancel(c.Request.Context().Err())
 			return
 		case <-keepAliveTicker.C:
-			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", handlers.OpenAIStreamHeartbeat(modelName))
 			flusher.Flush()
 		case errMsg, ok := <-errChan:
 			if !ok {
@@ -662,7 +662,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 
 	setSSEHeaders()
 	c.Status(http.StatusOK)
-	_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+	_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", handlers.OpenAIStreamHeartbeat(modelName))
 	flusher.Flush()
 
 	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
@@ -693,7 +693,7 @@ bootstrapLoop:
 			cliCancel(c.Request.Context().Err())
 			return
 		case <-bootstrapTicker.C:
-			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", handlers.OpenAIStreamHeartbeat(modelName))
 			flusher.Flush()
 		case res := <-bootstrap:
 			dataChan = res.dataChan
@@ -715,7 +715,7 @@ bootstrapLoop:
 			cliCancel(c.Request.Context().Err())
 			return
 		case <-keepAliveTicker.C:
-			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", handlers.OpenAIStreamHeartbeat(modelName))
 			flusher.Flush()
 		case errMsg, ok := <-errChan:
 			if !ok {
@@ -789,6 +789,9 @@ bootstrapLoop:
 }
 func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		WriteKeepAlive: func() {
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", handlers.OpenAIStreamHeartbeat(""))
+		},
 		WriteChunk: func(chunk []byte) {
 			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
 		},

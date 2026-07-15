@@ -30,7 +30,7 @@ func TestForwardStreamAttemptKeepaliveDoesNotCommitCandidate(t *testing.T) {
 		committed, errMsg := forwardStreamAttemptOnCommit(
 			context.Background(), subData, subErr, data, errs,
 			make(http.Header), make(http.Header), newPublicStreamSanitizer("combo-test"),
-			nil, nil, time.Second,
+			nil, nil, time.Second, []byte(": keep-alive\n\n"),
 		)
 		done <- result{committed: committed, err: errMsg}
 	}()

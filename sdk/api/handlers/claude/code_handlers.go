@@ -245,7 +245,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	// though origin is healthy.
 	setSSEHeaders()
 	c.Status(http.StatusOK)
-	_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+	_, _ = c.Writer.Write(handlers.ClaudeStreamHeartbeat())
 	flusher.Flush()
 
 	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
@@ -280,7 +280,7 @@ bootstrapLoop:
 			cliCancel(c.Request.Context().Err())
 			return
 		case <-bootstrapTicker.C:
-			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			_, _ = c.Writer.Write(handlers.ClaudeStreamHeartbeat())
 			flusher.Flush()
 		case res := <-bootstrap:
 			dataChan = res.dataChan
@@ -303,7 +303,7 @@ bootstrapLoop:
 			cliCancel(c.Request.Context().Err())
 			return
 		case <-keepAliveTicker.C:
-			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			_, _ = c.Writer.Write(handlers.ClaudeStreamHeartbeat())
 			flusher.Flush()
 		case errMsg, ok := <-errChan:
 			if !ok {
@@ -374,6 +374,9 @@ func pendingClaudeStreamError(errs <-chan *interfaces.ErrorMessage) (*interfaces
 
 func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		WriteKeepAlive: func() {
+			_, _ = c.Writer.Write(handlers.ClaudeStreamHeartbeat())
+		},
 		WriteChunk: func(chunk []byte) {
 			if len(chunk) == 0 {
 				return

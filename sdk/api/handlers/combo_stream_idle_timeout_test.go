@@ -72,6 +72,7 @@ func TestForwardStreamAttempt_HiddenReasoningResetsCommittedIdleTimeout(t *testi
 		func() {},
 		cancel,
 		100*time.Millisecond,
+		[]byte(": keep-alive\n\n"),
 	)
 	elapsed := time.Since(started)
 	close(dataOut)

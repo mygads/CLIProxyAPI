@@ -17,6 +17,9 @@ type emptyResponseFallbackExecutor struct{}
 func (e *emptyResponseFallbackExecutor) Identifier() string { return "codex" }
 
 func (e *emptyResponseFallbackExecutor) Execute(_ context.Context, _ *coreauth.Auth, req coreexecutor.Request, _ coreexecutor.Options) (coreexecutor.Response, error) {
+	if strings.Contains(req.Model, "semantic-empty") {
+		return coreexecutor.Response{Payload: []byte(`{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"hidden"},"finish_reason":"length","index":0}]}`)}, nil
+	}
 	if strings.Contains(req.Model, "empty") {
 		return coreexecutor.Response{}, nil
 	}
@@ -142,6 +145,21 @@ func TestExecuteWithAuthManager_EmptyResponseFallsThrough(t *testing.T) {
 		t.Fatalf("expected fallback payload, got %q", resp)
 	}
 	if len(metrics.records) != 2 || metrics.records[0].success || !metrics.records[1].success {
+		t.Fatalf("unexpected metrics: %+v", metrics.records)
+	}
+}
+
+func TestExecuteWithAuthManager_SemanticallyEmptyResponseFallsThrough(t *testing.T) {
+	handler, metrics := newEmptyResponseFallbackHandler(t, []ComboCandidate{
+		{Model: "emptyprov/semantic-empty"},
+		{Model: "fastprov/fast", IsLast: true},
+	})
+
+	resp, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "openai", "combo-empty", []byte(`{"model":"combo-empty","messages":[{"role":"user","content":"hi"}]}`), "")
+	if errMsg != nil || !strings.Contains(string(resp), "ok") {
+		t.Fatalf("expected healthy fallback, resp=%q err=%+v", resp, errMsg)
+	}
+	if len(metrics.records) != 2 || metrics.records[0].success || metrics.records[0].triggerReason != "empty_response" || !metrics.records[1].success {
 		t.Fatalf("unexpected metrics: %+v", metrics.records)
 	}
 }

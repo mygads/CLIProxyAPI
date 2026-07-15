@@ -675,6 +675,14 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 				h.recordComboAttempt(routeName, i, attempt.Model, isCombo, false, start, "malformed_tool_response")
 				continue
 			}
+			if isEmptyCompletionResponse(resp) {
+				h.recordComboAttempt(routeName, i, attempt.Model, isCombo, false, start, "empty_response")
+				emptyErr := emptyUpstreamResponseError(attempt.Model)
+				if attempt.IsLast || i == len(attempts)-1 {
+					return nil, headers, emptyErr
+				}
+				continue
+			}
 			h.recordComboAttempt(routeName, i, attempt.Model, isCombo, true, start, "")
 			return SanitizePublicResponse(resp, modelName), headers, nil
 		}
@@ -1044,7 +1052,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				idleStalled.Store(true)
 				cancel()
 			})
-			committed, errMsg := forwardStreamAttemptOnCommit(attemptCtx, subData, subErr, dataChan, errChan, headers, subHeaders, newPublicStreamSanitizer(modelName), func() { close(committedCh) }, onIdleStall, h.comboStreamIdleTimeout())
+			committed, errMsg := forwardStreamAttemptOnCommit(attemptCtx, subData, subErr, dataChan, errChan, headers, subHeaders, newPublicStreamSanitizer(modelName), func() { close(committedCh) }, onIdleStall, h.comboStreamIdleTimeout(), streamHeartbeatChunk(handlerType, modelName))
 			if committed {
 				// Bytes already reached the client, so we cannot fall back —
 				// but a watchdog abort is still a degraded outcome and must not
@@ -1169,7 +1177,7 @@ func forwardStreamAttempt(
 	subHeaders http.Header,
 	sanitizer *publicStreamSanitizer,
 ) (bool, *interfaces.ErrorMessage) {
-	return forwardStreamAttemptOnCommit(ctx, subData, subErr, dataChan, errChan, headers, subHeaders, sanitizer, nil, nil, comboStreamIdleTimeout)
+	return forwardStreamAttemptOnCommit(ctx, subData, subErr, dataChan, errChan, headers, subHeaders, sanitizer, nil, nil, comboStreamIdleTimeout, []byte(": keep-alive\n\n"))
 }
 
 // forwardStreamAttemptOnCommit is forwardStreamAttempt with an optional
@@ -1189,6 +1197,7 @@ func forwardStreamAttemptOnCommit(
 	onCommit func(),
 	onIdleStall context.CancelFunc,
 	idleTimeout time.Duration,
+	heartbeat []byte,
 ) (bool, *interfaces.ErrorMessage) {
 	// Adopt the underlying stream's headers up-front so combo entries
 	// that share a header set still surface the right Content-Type etc.
@@ -1244,7 +1253,7 @@ func forwardStreamAttemptOnCommit(
 		case <-doneCh(ctx):
 			return committed, nil
 		case <-keepaliveCh:
-			if !sendStreamData(ctx, dataChan, []byte(": keep-alive\n\n")) {
+			if !sendStreamData(ctx, dataChan, heartbeat) {
 				return committed, nil
 			}
 		case chunk, ok := <-subData:
