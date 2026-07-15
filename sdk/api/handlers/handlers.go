@@ -24,6 +24,7 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/tidwall/gjson"
 	"golang.org/x/net/context"
 )
 
@@ -351,6 +352,21 @@ type ComboMetricsRecorder interface {
 	Record(comboName string, entryIndex int, success bool, latency time.Duration, triggerReason string)
 }
 
+// ImageRouteResolver exposes the global image-routing scheme to the request
+// path. When a request carries an image AND targets a combo flagged here,
+// the handler replaces the combo's normal fallback chain with ChainModels.
+// A nil resolver (or Enabled()==false) disables the feature entirely.
+type ImageRouteResolver interface {
+	// Enabled reports whether image routing is turned on globally.
+	Enabled() bool
+	// IsRoutedCombo reports whether the given combo name is flagged for
+	// image routing (implies Enabled).
+	IsRoutedCombo(name string) bool
+	// ChainModels returns the ordered image fallback chain (target first).
+	// Entries may be plain prefixed models or combo names.
+	ChainModels() []string
+}
+
 // BaseAPIHandler contains the handlers for API endpoints.
 // It holds a pool of clients to interact with the backend service and manages
 // load balancing, client selection, and configuration.
@@ -374,6 +390,11 @@ type BaseAPIHandler struct {
 	// comboCooldowns tracks failures that only become visible after the auth
 	// executor has returned (for example a stream with no visible content).
 	comboCooldowns *comboCandidateCooldownRegistry
+
+	// ImageRouter is optional. When set and enabled, an image-carrying
+	// request to a flagged combo is re-routed onto a dedicated fallback
+	// chain instead of the combo's normal chain. Nil disables the feature.
+	ImageRouter ImageRouteResolver
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.
@@ -626,6 +647,11 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	// list is exhausted. For single-model requests this collapses to the
 	// same single-call behaviour the code had before combos existed.
 	attempts := h.resolveModelAttempts(modelName)
+	// Image override: an image-carrying request to a flagged combo runs the
+	// dedicated image chain INSTEAD of the combo's normal chain (isolated).
+	if imgAttempts, ok := h.maybeImageReroute(modelName, rawJSON); ok {
+		attempts = imgAttempts
+	}
 	isCombo := len(attempts) > 1
 	for i, attempt := range attempts {
 		if isCombo && i < len(attempts)-1 && !h.comboCandidateAvailable(modelName, attempt.Model) {
@@ -891,6 +917,11 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	rawJSON = h.injectComboLanguageGuard(handlerType, modelName, rawJSON)
 
 	attempts := h.resolveModelAttempts(modelName)
+	// Image override: an image-carrying request to a flagged combo runs the
+	// dedicated image chain INSTEAD of the combo's normal chain (isolated).
+	if imgAttempts, ok := h.maybeImageReroute(modelName, rawJSON); ok {
+		attempts = imgAttempts
+	}
 	// Single-candidate path skips the buffered indirection so existing
 	// non-combo behaviour stays bit-for-bit identical (header timing,
 	// keep-alives, bootstrap retries).
@@ -1536,6 +1567,115 @@ func (h *BaseAPIHandler) resolveModelAttempts(modelName string) []modelAttempt {
 	}
 	out[len(out)-1].IsLast = true
 	return out
+}
+
+// maybeImageReroute returns a replacement attempt chain when the request
+// should be re-routed to the global image-routing scheme, and false when it
+// should follow its normal combo chain. The rewrite is TOTAL (isolated): an
+// image request to a flagged combo runs ONLY the image chain — it never falls
+// back to the combo's own candidates. Guards, cheapest first:
+//   - image router not wired / disabled
+//   - modelName is not a flagged combo (cheap set lookup, no body scan)
+//   - request carries no image (only scanned once the combo is flagged)
+func (h *BaseAPIHandler) maybeImageReroute(modelName string, rawJSON []byte) ([]modelAttempt, bool) {
+	if h == nil || h.ImageRouter == nil || !h.ImageRouter.Enabled() {
+		return nil, false
+	}
+	if !h.ImageRouter.IsRoutedCombo(modelName) {
+		return nil, false
+	}
+	if !requestHasImage(rawJSON) {
+		return nil, false
+	}
+	attempts := h.resolveImageAttempts()
+	if len(attempts) == 0 {
+		return nil, false
+	}
+	return attempts, true
+}
+
+// resolveImageAttempts expands the global image chain into leaf attempts,
+// reusing flattenComboAttempts so a chain entry that is itself a combo is
+// inlined exactly like a normal combo entry. Dedups leaves and stamps the
+// final one IsLast — mirrors resolveModelAttempts.
+func (h *BaseAPIHandler) resolveImageAttempts() []modelAttempt {
+	if h == nil || h.ImageRouter == nil {
+		return nil
+	}
+	models := h.ImageRouter.ChainModels()
+	if len(models) == 0 {
+		return nil
+	}
+	out := make([]modelAttempt, 0, len(models))
+	seenModel := make(map[string]struct{}, len(models))
+	add := func(a modelAttempt) {
+		key := strings.ToLower(strings.TrimSpace(a.Model))
+		if key == "" {
+			return
+		}
+		if _, dup := seenModel[key]; dup {
+			return
+		}
+		seenModel[key] = struct{}{}
+		a.IsLast = false
+		out = append(out, a)
+	}
+	for _, m := range models {
+		// A chain entry may itself be a combo — inline its leaves. If it is
+		// not a combo (or unexpandable), treat it as a plain leaf model.
+		if child := h.flattenComboAttempts(strings.TrimSpace(m), make(map[string]struct{})); len(child) > 0 {
+			for _, a := range child {
+				add(a)
+			}
+			continue
+		}
+		add(modelAttempt{Model: m})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	out[len(out)-1].IsLast = true
+	return out
+}
+
+// requestHasImage reports whether the raw request body carries an image part.
+// It covers the two client formats coding agents use — OpenAI chat/responses
+// (content parts of type "image_url" or "input_image") and Anthropic messages
+// (content parts of type "image"). Gemini inline_data is intentionally out of
+// scope for now. The scan is a bounded gjson walk over messages[].content[];
+// it never allocates the whole payload and returns on the first hit.
+func requestHasImage(rawJSON []byte) bool {
+	if len(rawJSON) == 0 {
+		return false
+	}
+	found := false
+	scanContent := func(content gjson.Result) {
+		if found || !content.IsArray() {
+			return
+		}
+		content.ForEach(func(_, part gjson.Result) bool {
+			switch strings.ToLower(part.Get("type").String()) {
+			case "image_url", "image", "input_image":
+				found = true
+				return false
+			}
+			return true
+		})
+	}
+	// OpenAI chat + Anthropic messages: top-level messages[].content[].
+	gjson.GetBytes(rawJSON, "messages").ForEach(func(_, msg gjson.Result) bool {
+		scanContent(msg.Get("content"))
+		return !found
+	})
+	if found {
+		return true
+	}
+	// OpenAI Responses format: top-level input[].content[].
+	gjson.GetBytes(rawJSON, "input").ForEach(func(_, item gjson.Result) bool {
+		scanContent(item.Get("content"))
+		return !found
+	})
+	return found
 }
 
 // flattenComboAttempts expands a combo name into the ordered list of leaf

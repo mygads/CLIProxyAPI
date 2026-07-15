@@ -32,6 +32,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/combo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/imagerouting"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
@@ -130,6 +131,34 @@ func WithPostAuthHook(hook auth.PostAuthHook) ServerOption {
 // comboResolverAdapter bridges *combo.Registry to the
 // sdk/api/handlers.ComboResolver interface without creating an import cycle.
 // The internal/combo package cannot import sdk/api/handlers, so we define
+// imageRouterAdapter bridges the internal/imagerouting registry to the SDK
+// handlers.ImageRouteResolver interface, keeping the imagerouting package out
+// of the handlers layer (same pattern as comboResolverAdapter).
+type imageRouterAdapter struct {
+	reg *imagerouting.Registry
+}
+
+func (a *imageRouterAdapter) Enabled() bool {
+	if a == nil || a.reg == nil {
+		return false
+	}
+	return a.reg.Enabled()
+}
+
+func (a *imageRouterAdapter) IsRoutedCombo(name string) bool {
+	if a == nil || a.reg == nil {
+		return false
+	}
+	return a.reg.IsRoutedCombo(name)
+}
+
+func (a *imageRouterAdapter) ChainModels() []string {
+	if a == nil || a.reg == nil {
+		return nil
+	}
+	return a.reg.ChainModels()
+}
+
 // the adapter here in the internal/api layer which can see both.
 type comboResolverAdapter struct {
 	reg *combo.Registry
@@ -254,6 +283,9 @@ type Server struct {
 	// in NewServer. See internal/combo + PRD §3.3.
 	combos     *combo.Registry
 	comboStore *combo.FileStore
+
+	imageRouting      *imagerouting.Registry
+	imageRoutingStore *imagerouting.FileStore
 
 	// ampModule is the Amp routing module for model mapping hot-reload
 	ampModule *ampmodule.AmpModule
@@ -404,6 +436,28 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 			adapter := &comboResolverAdapter{reg: comboReg}
 			s.handlers.Combos = adapter
 			s.handlers.ComboMetrics = adapter
+		}
+	}
+
+	// Global image-routing scheme. Persisted next to combos under
+	// <auth-dir>/image_routing.json. When enabled, an image-carrying request
+	// to a flagged combo is re-routed onto a dedicated chain. Load failure is
+	// logged but not fatal — an empty (disabled) config still boots.
+	{
+		authDir := strings.TrimSpace(cfg.AuthDir)
+		if authDir == "" {
+			authDir = "."
+		}
+		imgReg := imagerouting.NewRegistry()
+		imgStore := imagerouting.NewFileStore(filepath.Join(authDir, "image_routing.json"))
+		if err := imgStore.Load(imgReg); err != nil {
+			log.Warnf("image routing store: %v", err)
+		}
+		s.imageRouting = imgReg
+		s.imageRoutingStore = imgStore
+		s.mgmt.SetImageRouting(imgReg, imgStore)
+		if s.handlers != nil {
+			s.handlers.ImageRouter = &imageRouterAdapter{reg: imgReg}
 		}
 	}
 
@@ -858,6 +912,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/combos/:name", s.mgmt.PutCombo)
 		mgmt.DELETE("/combos/:name", s.mgmt.DeleteCombo)
 		mgmt.GET("/combos/:name/metrics", s.mgmt.GetComboMetrics)
+
+		// Global image-routing scheme. See internal/imagerouting.
+		mgmt.GET("/image-routing", s.mgmt.GetImageRouting)
+		mgmt.PUT("/image-routing", s.mgmt.PutImageRouting)
 
 		// Circuit breaker observability + manual overrides. The list
 		// endpoint always returns (possibly empty); the force endpoint

@@ -16,6 +16,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/combo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/imagerouting"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"golang.org/x/crypto/bcrypt"
@@ -49,6 +50,8 @@ type Handler struct {
 	postAuthHook        coreauth.PostAuthHook
 	comboRegistry       *combo.Registry
 	comboStore          *combo.FileStore
+	imageRegistry       *imagerouting.Registry
+	imageStore          *imagerouting.FileStore
 }
 
 // NewHandler creates a new management handler instance.
@@ -146,6 +149,30 @@ func (h *Handler) ComboRegistry() *combo.Registry {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.comboRegistry
+}
+
+// SetImageRouting wires the global image-routing registry and its persistent
+// store into the management handler. Safe to call before or after the first
+// request — read paths nil-check the registry.
+func (h *Handler) SetImageRouting(r *imagerouting.Registry, store *imagerouting.FileStore) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.imageRegistry = r
+	h.imageStore = store
+	h.mu.Unlock()
+}
+
+// ImageRoutingRegistry returns the registry installed via SetImageRouting, or
+// nil when the feature is disabled.
+func (h *Handler) ImageRoutingRegistry() *imagerouting.Registry {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.imageRegistry
 }
 
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
