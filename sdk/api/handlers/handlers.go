@@ -1218,6 +1218,14 @@ func forwardStreamAttemptOnCommit(
 				subData = nil
 				continue
 			}
+			// Any upstream byte proves the committed stream is still alive,
+			// including provider reasoning chunks that are intentionally removed
+			// from the public response below. Reset before sanitizing so a model
+			// that spends a long time emitting hidden thinking is not mistaken for
+			// a stalled provider and cancelled at the idle deadline.
+			if committed {
+				resetIdle()
+			}
 			safe := sanitizePublicResponseWithState(chunk, sanitizer.publicModel, sanitizer)
 			if len(safe) == 0 || !publicChunkHasVisibleContent(safe) {
 				continue
@@ -1252,7 +1260,6 @@ func forwardStreamAttemptOnCommit(
 				pendingPayload = nil
 				continue
 			}
-			resetIdle()
 			if !sendStreamData(ctx, dataChan, safe) {
 				return committed, nil
 			}

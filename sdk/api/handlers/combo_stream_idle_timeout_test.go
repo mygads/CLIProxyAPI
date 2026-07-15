@@ -1,11 +1,13 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -23,6 +25,70 @@ func (e *stallAfterCommitStreamExecutor) Identifier() string { return "codex" }
 
 func (e *stallAfterCommitStreamExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
 	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "Execute not implemented"}
+}
+
+func TestForwardStreamAttempt_HiddenReasoningResetsCommittedIdleTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	subData := make(chan []byte)
+	subErr := make(chan *interfaces.ErrorMessage)
+	dataOut := make(chan []byte, 16)
+	errOut := make(chan *interfaces.ErrorMessage, 1)
+	go func() {
+		defer close(subData)
+		defer close(subErr)
+		send := func(payload string) bool {
+			select {
+			case subData <- []byte(payload):
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		if !send(`data: {"choices":[{"delta":{"content":"start"},"index":0}]}`) {
+			return
+		}
+		for range 4 {
+			time.Sleep(50 * time.Millisecond)
+			if !send(`data: {"choices":[{"delta":{"reasoning_content":"hidden"},"index":0}]}`) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+		_ = send(`data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop","index":0}]}`)
+	}()
+
+	started := time.Now()
+	committed, errMsg := forwardStreamAttemptOnCommit(
+		ctx,
+		subData,
+		subErr,
+		dataOut,
+		errOut,
+		make(http.Header),
+		make(http.Header),
+		newPublicStreamSanitizer("genfity/test"),
+		func() {},
+		cancel,
+		100*time.Millisecond,
+	)
+	elapsed := time.Since(started)
+	close(dataOut)
+
+	var output []byte
+	for chunk := range dataOut {
+		output = append(output, chunk...)
+	}
+	if !committed || errMsg != nil {
+		t.Fatalf("expected clean committed stream, committed=%v err=%v", committed, errMsg)
+	}
+	if !bytes.Contains(output, []byte("done")) {
+		t.Fatalf("idle watchdog fired despite live hidden reasoning; output=%q", output)
+	}
+	if elapsed < 225*time.Millisecond {
+		t.Fatalf("stream ended too early; hidden reasoning did not keep it alive: %v", elapsed)
+	}
 }
 
 func (e *stallAfterCommitStreamExecutor) ExecuteStream(ctx context.Context, _ *coreauth.Auth, req coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
