@@ -2051,7 +2051,17 @@ func (h *BaseAPIHandler) recordIncompatiblePayloadSkip(ctx context.Context, comb
 		"message_count":          issue.MessageCount,
 		"tool_count":             issue.ToolCount,
 		"tool_names_sample":      issue.ToolNamesSample,
-	}).Info("skipping Kiro candidate during compatibility preflight")
+	}).Infof(
+		"skipping Kiro candidate during compatibility preflight: combo=%q candidate=%q routing_reason=incompatible_payload incompatibility_reason=%q detail=%q tool=%q messages=%d tools=%d tool_sample=%q",
+		comboName,
+		candidateModel,
+		issue.Reason,
+		issue.Detail,
+		issue.ToolName,
+		issue.MessageCount,
+		issue.ToolCount,
+		strings.Join(issue.ToolNamesSample, ","),
+	)
 	if isCombo && h != nil && h.ComboMetrics != nil {
 		h.ComboMetrics.Record(comboName, entryIndex, false, 0, "incompatible_payload")
 	}
