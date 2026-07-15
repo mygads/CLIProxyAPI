@@ -668,11 +668,17 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 //
 // Production code reads the configured value from SDKConfig via the
 // comboAttemptTimeout method; this var is kept so existing tests can still
-// shrink it by assigning directly. 120s: accommodate reasoning/thinking models
-// that are slow to emit their first byte; the post-commit idle watchdog still
-// bounds a stream that starts then stalls. Override via
+// shrink it by assigning directly. Thirty seconds bounds only bootstrap, not
+// the full generation, and lets the chain reach later candidates before common
+// 60s client idle deadlines. Override via
 // combo-attempt-timeout-seconds in config.
-var comboAttemptTimeout = 120 * time.Second
+var comboAttemptTimeout = 30 * time.Second
+
+// comboStreamKeepaliveInterval keeps downstream SSE readers alive while a
+// combo candidate is still bootstrapping or while fallback is in progress.
+// Heartbeats never count as provider content and therefore never commit a
+// candidate or prevent fallback.
+var comboStreamKeepaliveInterval = 15 * time.Second
 
 // defaultComboStreamIdleTimeout bounds how long an ALREADY-COMMITTED stream may go
 // without receiving any byte from the upstream before it is abandoned. The
@@ -1142,6 +1148,14 @@ func forwardStreamAttemptOnCommit(
 		}
 	}()
 
+	var keepalive *time.Ticker
+	var keepaliveCh <-chan time.Time
+	if comboStreamKeepaliveInterval > 0 {
+		keepalive = time.NewTicker(comboStreamKeepaliveInterval)
+		keepaliveCh = keepalive.C
+		defer keepalive.Stop()
+	}
+
 	committed := false
 	var pendingChunks [][]byte
 	var pendingPayload []byte
@@ -1149,6 +1163,10 @@ func forwardStreamAttemptOnCommit(
 		select {
 		case <-doneCh(ctx):
 			return committed, nil
+		case <-keepaliveCh:
+			if !sendStreamData(ctx, dataChan, []byte(": keep-alive\n\n")) {
+				return committed, nil
+			}
 		case chunk, ok := <-subData:
 			if !ok {
 				subData = nil

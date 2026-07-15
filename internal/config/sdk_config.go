@@ -62,7 +62,7 @@ type SDKConfig struct {
 
 	// ComboAttemptTimeoutSeconds caps how long a single non-last combo candidate may run
 	// before it is abandoned and the loop falls through to the next entry.
-	// Default is 15 seconds. Set to 0 to disable the per-attempt timeout (not recommended).
+	// Default is 30 seconds. Set to 0 to use the default.
 	ComboAttemptTimeoutSeconds int `yaml:"combo-attempt-timeout-seconds,omitempty" json:"combo-attempt-timeout-seconds,omitempty"`
 
 	// ComboStreamIdleTimeoutSeconds bounds how long an already-committed combo stream
@@ -81,16 +81,13 @@ func (c *SDKConfig) UpstreamTimeout() time.Duration {
 }
 
 // defaultComboAttemptTimeout bounds time-to-first-byte for a non-last combo
-// candidate before the loop falls through to the next entry. Set to 120s to
-// accommodate reasoning/thinking models (opus-4.8, gpt-5.5) that legitimately
-// take a long time to emit their first byte — a shorter bound (e.g. 15s) cut
-// those off mid-think and forced a fallthrough that could end in failure even
-// though the candidate would have succeeded given time. The post-commit idle
-// timeout still bounds a stream that starts then stalls, and the ctx cancel on
-// timeout closes the upstream HTTP connection so an abandoned attempt is not
-// billed by the provider. Operators can override via
-// combo-attempt-timeout-seconds in config.
-const defaultComboAttemptTimeout = 120 * time.Second
+// candidate before the loop falls through to the next entry. This bounds only
+// time-to-first-visible-content, not the full generation. Thirty seconds keeps
+// two dead candidates inside the common 60s client idle window while still
+// allowing reasoning models time to bootstrap. The post-commit idle timeout
+// separately guards a stream that starts and later stalls. Operators can
+// override via combo-attempt-timeout-seconds in config.
+const defaultComboAttemptTimeout = 30 * time.Second
 
 // defaultComboStreamIdleTimeout bounds a post-commit stall (stream already
 // producing, then goes silent). Kept longer (60s) than the bootstrap timeout
@@ -99,7 +96,7 @@ const defaultComboAttemptTimeout = 120 * time.Second
 const defaultComboStreamIdleTimeout = 60 * time.Second
 
 // ComboAttemptTimeout returns the configured per-attempt combo timeout.
-// Defaults to 15s if not set or zero.
+// Defaults to 30s if not set or zero.
 func (c *SDKConfig) ComboAttemptTimeout() time.Duration {
 	if c == nil || c.ComboAttemptTimeoutSeconds <= 0 {
 		return defaultComboAttemptTimeout
