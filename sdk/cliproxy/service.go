@@ -776,9 +776,12 @@ func (s *Service) Run(ctx context.Context) error {
 		redisqueue.SetUsageStatisticsEnabled(true)
 	}
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
-	defer shutdownCancel()
 	defer func() {
+		// Create the deadline when shutdown begins. A context created here at
+		// service startup would already be expired on any normally long-lived
+		// process, causing deployments to abort active requests immediately.
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
+		defer shutdownCancel()
 		if err := s.Shutdown(shutdownCtx); err != nil {
 			log.Errorf("service shutdown returned error: %v", err)
 		}
