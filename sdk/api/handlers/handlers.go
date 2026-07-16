@@ -54,12 +54,7 @@ const idempotencyKeyMetadataKey = "idempotency_key"
 const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
-	// providerStartedSSEMarker is an internal, protocol-safe signal consumed
-	// by Genfity Gateway. It is emitted only after the upstream accepted the
-	// request and returned a successful streaming response. SSE clients that
-	// connect directly to CLIProxy safely ignore it as a comment.
-	providerStartedSSEMarker = ": genfity-provider-started\n\n"
-	providerEvidenceHeader   = "X-Genfity-Provider-Evidence"
+	providerEvidenceHeader           = "X-Genfity-Provider-Evidence"
 )
 
 type pinnedAuthContextKey struct{}
@@ -994,7 +989,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		data, headers, errs, providerStarted := h.executeStreamSingle(ctx, handlerType, target, rawJSON, alt)
 		data = sanitizePublicStream(data, modelName)
 		if providerStarted && providerEvidenceRequested {
-			data = prependProviderStartedMarker(ctx, data)
+			data = prependProviderStartedMarker(ctx, data, handlerType)
 		}
 		return data, headers, errs
 	}
@@ -1074,7 +1069,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				}()
 			}
 			subData, subHeaders, subErr, providerStarted := h.executeStreamSingle(attemptCtx, handlerType, attempt.Model, rawJSON, alt)
-			if providerStarted && providerEvidenceRequested && !sendStreamData(ctx, dataChan, []byte(providerStartedSSEMarker)) {
+			if providerStarted && providerEvidenceRequested && !sendStreamData(ctx, dataChan, providerStartedChunk(handlerType)) {
 				cancel()
 				return
 			}
@@ -1385,11 +1380,11 @@ func sendStreamData(ctx context.Context, ch chan<- []byte, chunk []byte) bool {
 	}
 }
 
-func prependProviderStartedMarker(ctx context.Context, data <-chan []byte) <-chan []byte {
+func prependProviderStartedMarker(ctx context.Context, data <-chan []byte, handlerType string) <-chan []byte {
 	out := make(chan []byte)
 	go func() {
 		defer close(out)
-		if !sendStreamData(ctx, out, []byte(providerStartedSSEMarker)) {
+		if !sendStreamData(ctx, out, providerStartedChunk(handlerType)) {
 			return
 		}
 		for chunk := range data {
@@ -1399,6 +1394,20 @@ func prependProviderStartedMarker(ctx context.Context, data <-chan []byte) <-cha
 		}
 	}()
 	return out
+}
+
+func providerStartedChunk(handlerType string) []byte {
+	const markerJSON = `{"type":"genfity.provider_started","genfity_internal":true}`
+	switch handlerType {
+	case "openai":
+		// OpenAI handlers add the SSE data envelope around channel chunks.
+		return []byte(markerJSON)
+	case "claude":
+		// Claude handlers expect complete SSE events on the channel.
+		return []byte("event: genfity.provider_started\ndata: " + markerJSON + "\n\n")
+	default:
+		return []byte(": genfity-provider-started\n\n")
+	}
 }
 
 func sendStreamErr(ctx context.Context, ch chan<- *interfaces.ErrorMessage, msg *interfaces.ErrorMessage) bool {
