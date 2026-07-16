@@ -54,6 +54,12 @@ const idempotencyKeyMetadataKey = "idempotency_key"
 const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
+	// providerStartedSSEMarker is an internal, protocol-safe signal consumed
+	// by Genfity Gateway. It is emitted only after the upstream accepted the
+	// request and returned a successful streaming response. SSE clients that
+	// connect directly to CLIProxy safely ignore it as a comment.
+	providerStartedSSEMarker = ": genfity-provider-started\n\n"
+	providerEvidenceHeader   = "X-Genfity-Provider-Evidence"
 )
 
 type pinnedAuthContextKey struct{}
@@ -946,6 +952,7 @@ func (h *BaseAPIHandler) executeCountSingle(ctx context.Context, handlerType, mo
 // recovery (auth rotation within the same candidate) still runs and is
 // orthogonal to combo iteration.
 func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	providerEvidenceRequested := headersFromContext(ctx).Get(providerEvidenceHeader) == "1"
 	// Identity intercept (streaming): if the model is a combo with a
 	// DisplayName and the request is an identity question, emit fabricated
 	// SSE chunks instead of hitting upstream.
@@ -984,8 +991,12 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				return dataChan, nil, errChan
 			}
 		}
-		data, headers, errs := h.executeStreamSingle(ctx, handlerType, target, rawJSON, alt)
-		return sanitizePublicStream(data, modelName), headers, errs
+		data, headers, errs, providerStarted := h.executeStreamSingle(ctx, handlerType, target, rawJSON, alt)
+		data = sanitizePublicStream(data, modelName)
+		if providerStarted && providerEvidenceRequested {
+			data = prependProviderStartedMarker(ctx, data)
+		}
+		return data, headers, errs
 	}
 
 	// Multi-candidate combo path. Try each entry; the first one that
@@ -1062,7 +1073,11 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 					}
 				}()
 			}
-			subData, subHeaders, subErr := h.executeStreamSingle(attemptCtx, handlerType, attempt.Model, rawJSON, alt)
+			subData, subHeaders, subErr, providerStarted := h.executeStreamSingle(attemptCtx, handlerType, attempt.Model, rawJSON, alt)
+			if providerStarted && providerEvidenceRequested && !sendStreamData(ctx, dataChan, []byte(providerStartedSSEMarker)) {
+				cancel()
+				return
+			}
 			// onCommit fires once, when the first visible byte is forwarded.
 			// onIdleStall aborts a stream that committed then stalled
 			// mid-generation; it flags the reason before cancelling.
@@ -1370,6 +1385,22 @@ func sendStreamData(ctx context.Context, ch chan<- []byte, chunk []byte) bool {
 	}
 }
 
+func prependProviderStartedMarker(ctx context.Context, data <-chan []byte) <-chan []byte {
+	out := make(chan []byte)
+	go func() {
+		defer close(out)
+		if !sendStreamData(ctx, out, []byte(providerStartedSSEMarker)) {
+			return
+		}
+		for chunk := range data {
+			if !sendStreamData(ctx, out, chunk) {
+				return
+			}
+		}
+	}()
+	return out
+}
+
 func sendStreamErr(ctx context.Context, ch chan<- *interfaces.ErrorMessage, msg *interfaces.ErrorMessage) bool {
 	if msg == nil {
 		return false
@@ -1389,13 +1420,13 @@ func sendStreamErr(ctx context.Context, ch chan<- *interfaces.ErrorMessage, msg 
 // executeStreamSingle is the original single-attempt streaming path
 // extracted so combo fallback can iterate over candidates without
 // duplicating bootstrap-retry, keep-alive, and header bookkeeping.
-func (h *BaseAPIHandler) executeStreamSingle(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+func (h *BaseAPIHandler) executeStreamSingle(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage, bool) {
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
 		close(errChan)
-		return nil, nil, errChan
+		return nil, nil, errChan, false
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
@@ -1408,12 +1439,14 @@ func (h *BaseAPIHandler) executeStreamSingle(ctx context.Context, handlerType, m
 		Model:   normalizedModel,
 		Payload: payload,
 	}
+	requestHeaders := headersFromContext(ctx)
+	requestHeaders.Del(providerEvidenceHeader)
 	opts := coreexecutor.Options{
 		Stream:          true,
 		Alt:             alt,
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
-		Headers:         headersFromContext(ctx),
+		Headers:         requestHeaders,
 	}
 	opts.Metadata = reqMeta
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
@@ -1434,7 +1467,7 @@ func (h *BaseAPIHandler) executeStreamSingle(ctx context.Context, handlerType, m
 		}
 		errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 		close(errChan)
-		return nil, nil, errChan
+		return nil, nil, errChan, false
 	}
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	// Capture upstream headers from the initial connection synchronously before the goroutine starts.
@@ -1562,7 +1595,7 @@ func (h *BaseAPIHandler) executeStreamSingle(ctx context.Context, handlerType, m
 			}
 		}
 	}()
-	return dataChan, upstreamHeaders, errChan
+	return dataChan, upstreamHeaders, errChan, true
 }
 
 func validateSSEDataJSON(chunk []byte) error {
