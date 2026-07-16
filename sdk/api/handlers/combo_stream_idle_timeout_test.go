@@ -194,3 +194,10 @@ func TestExecuteStreamWithAuthManager_PostCommitIdleStallBounded(t *testing.T) {
 		t.Fatalf("expected at least the committed chunk to reach the client")
 	}
 }
+
+func TestComboStreamIdleTimeoutDefaultAllowsLongThinkingGap(t *testing.T) {
+	h := &BaseAPIHandler{}
+	if got := h.comboStreamIdleTimeout(); got < 120*time.Second {
+		t.Fatalf("default stream idle timeout=%s, want at least 120s for thinking providers", got)
+	}
+}

@@ -759,7 +759,7 @@ var comboStreamKeepaliveInterval = 15 * time.Second
 // Production code reads the configured value from SDKConfig via the
 // comboStreamIdleTimeout method; this var is kept so existing tests can still
 // shrink it by assigning directly.
-var comboStreamIdleTimeout = 60 * time.Second
+var comboStreamIdleTimeout = 120 * time.Second
 
 // comboAttemptTimeout returns the configured per-attempt combo timeout.
 // Falls back to the package-level default when no config is available.
