@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -81,10 +82,44 @@ func TestKiroPayloadCompatibilityKnownProductionLimits(t *testing.T) {
 		t.Fatalf("issue=%#v", issue)
 	}
 
-	large := []byte(`{"messages":[{"role":"user","content":"` + strings.Repeat("x", maxKiroPayloadBytes) + `"}]}`)
-	issue = kiroPayloadCompatibilityIssue(large)
-	if issue == nil || issue.Reason != "request_too_large" {
-		t.Fatalf("large issue=%#v", issue)
+	largeText := []byte(`{"messages":[{"role":"user","content":"` + strings.Repeat("x", (1<<20)+1) + `"}]}`)
+	if issue = kiroPayloadCompatibilityIssue(largeText); issue != nil {
+		t.Fatalf("raw byte length must not stand in for Kiro context capacity: %#v", issue)
+	}
+}
+
+func TestKiroPayloadCompatibilityUsesDecodedImageLimits(t *testing.T) {
+	encodeImagePayload := func(size int) []byte {
+		data := base64.StdEncoding.EncodeToString(make([]byte, size))
+		raw, err := json.Marshal(map[string]any{
+			"messages": []any{map[string]any{
+				"role": "user",
+				"content": []any{map[string]any{
+					"type":      "image_url",
+					"image_url": map[string]any{"url": "data:image/png;base64," + data},
+				}},
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+
+	// A normal image request is larger than the old 1 MiB raw-body guard,
+	// but remains well inside Amazon Q's decoded per-image limit.
+	valid := encodeImagePayload(1_200_000)
+	if len(valid) <= 1<<20 {
+		t.Fatalf("test payload unexpectedly small: %d", len(valid))
+	}
+	if issue := kiroPayloadCompatibilityIssue(valid); issue != nil {
+		t.Fatalf("valid image rejected: %+v", issue)
+	}
+
+	oversized := encodeImagePayload(maxKiroImageBytes + 1)
+	issue := kiroPayloadCompatibilityIssue(oversized)
+	if issue == nil || issue.Reason != "image_too_large" || issue.ImageCount != 1 || issue.MaxImageBytes != maxKiroImageBytes+1 {
+		t.Fatalf("oversized image issue=%+v", issue)
 	}
 }
 

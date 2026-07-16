@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"regexp"
 	"sort"
@@ -11,14 +13,18 @@ import (
 )
 
 const (
-	// Live Kiro rejects multi-megabyte OpenCode histories with
-	// CONTENT_LENGTH_EXCEEDS_THRESHOLD. Keep enough headroom for translator
-	// expansion and route larger, otherwise-valid public payloads elsewhere.
-	maxKiroPayloadBytes = 1 << 20
-	maxKiroMessages     = 200
-	maxKiroTools        = 64
-	maxKiroToolSchema   = 64 << 10
-	maxKiroAllSchemas   = 256 << 10
+	maxKiroMessages   = 200
+	maxKiroTools      = 64
+	maxKiroToolSchema = 64 << 10
+	maxKiroAllSchemas = 256 << 10
+
+	// Amazon Q Developer supports up to 20 images per message and 3.75 MB
+	// per decoded image. Raw JSON byte length is deliberately not used as a
+	// proxy for model context: base64 expands images by roughly one third,
+	// while a 1M-token text context can legitimately exceed the old 1 MiB
+	// guard by several times.
+	maxKiroImages     = 20
+	maxKiroImageBytes = 3_750_000
 )
 
 var kiroToolNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
@@ -30,6 +36,9 @@ type kiroCompatibilityIssue struct {
 	MessageCount    int
 	ToolCount       int
 	ToolNamesSample []string
+	PayloadBytes    int
+	ImageCount      int
+	MaxImageBytes   int
 }
 
 func isKiroServer3Candidate(model string) bool {
@@ -42,11 +51,7 @@ func isKiroServer3Candidate(model string) bool {
 // the combo loop to continue to its next provider without poisoning Kiro's
 // cooldown/health score.
 func kiroPayloadCompatibilityIssue(rawJSON []byte) *kiroCompatibilityIssue {
-	issue := &kiroCompatibilityIssue{}
-	if len(rawJSON) > maxKiroPayloadBytes {
-		issue.Reason = "request_too_large"
-		return issue
-	}
+	issue := &kiroCompatibilityIssue{PayloadBytes: len(rawJSON)}
 
 	decoder := json.NewDecoder(bytes.NewReader(rawJSON))
 	decoder.UseNumber()
@@ -54,6 +59,10 @@ func kiroPayloadCompatibilityIssue(rawJSON []byte) *kiroCompatibilityIssue {
 	if err := decoder.Decode(&payload); err != nil {
 		issue.Reason = "invalid_json"
 		return issue
+	}
+	if imageIssue := kiroImageCompatibilityIssue(payload); imageIssue != nil {
+		imageIssue.PayloadBytes = len(rawJSON)
+		return imageIssue
 	}
 	messages, _ := payload["messages"].([]any)
 	issue.MessageCount = len(messages)
@@ -231,6 +240,84 @@ func kiroPayloadCompatibilityIssue(rawJSON []byte) *kiroCompatibilityIssue {
 		}
 	}
 	return nil
+}
+
+func kiroImageCompatibilityIssue(payload map[string]any) *kiroCompatibilityIssue {
+	issue := &kiroCompatibilityIssue{}
+	inspectContent := func(rawContent any) bool {
+		parts, _ := rawContent.([]any)
+		for _, rawPart := range parts {
+			part, _ := rawPart.(map[string]any)
+			if part == nil {
+				continue
+			}
+			var encoded string
+			switch strings.ToLower(textField(part, "type")) {
+			case "image_url", "input_image":
+				if imageURL, ok := part["image_url"].(map[string]any); ok {
+					encoded = base64FromDataURI(textField(imageURL, "url"))
+				} else if imageURL, ok := part["image_url"].(string); ok {
+					encoded = base64FromDataURI(imageURL)
+				}
+			case "image":
+				source, _ := part["source"].(map[string]any)
+				if strings.EqualFold(textField(source, "type"), "base64") {
+					encoded = textField(source, "data")
+				}
+			}
+			if encoded == "" {
+				continue
+			}
+			issue.ImageCount++
+			decodedBytes, err := io.Copy(io.Discard, base64.NewDecoder(base64.StdEncoding, strings.NewReader(encoded)))
+			if err != nil {
+				issue.Reason = "invalid_image_data"
+				issue.Detail = fmt.Sprintf("image %d is not valid base64", issue.ImageCount)
+				return false
+			}
+			if decodedBytes > int64(issue.MaxImageBytes) {
+				issue.MaxImageBytes = int(decodedBytes)
+			}
+			if decodedBytes > maxKiroImageBytes {
+				issue.Reason = "image_too_large"
+				issue.Detail = fmt.Sprintf("image %d is %d bytes; maximum is %d", issue.ImageCount, decodedBytes, maxKiroImageBytes)
+				return false
+			}
+			if issue.ImageCount > maxKiroImages {
+				issue.Reason = "too_many_images"
+				issue.Detail = fmt.Sprintf("request has more than %d embedded images", maxKiroImages)
+				return false
+			}
+		}
+		return true
+	}
+	inspectItems := func(rawItems any) bool {
+		items, _ := rawItems.([]any)
+		for _, rawItem := range items {
+			item, _ := rawItem.(map[string]any)
+			if item != nil && !inspectContent(item["content"]) {
+				return false
+			}
+		}
+		return true
+	}
+	if !inspectItems(payload["messages"]) || !inspectItems(payload["input"]) {
+		return issue
+	}
+	return nil
+}
+
+func base64FromDataURI(value string) string {
+	value = strings.TrimSpace(value)
+	comma := strings.Index(value, ",")
+	if !strings.HasPrefix(strings.ToLower(value), "data:image/") || comma < 0 {
+		return ""
+	}
+	metadata := strings.ToLower(value[:comma])
+	if !strings.Contains(metadata, ";base64") {
+		return ""
+	}
+	return value[comma+1:]
 }
 
 func validateKiroToolArguments(value any, schema map[string]any, path string) error {

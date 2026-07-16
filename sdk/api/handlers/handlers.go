@@ -657,9 +657,18 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	}
 	isCombo := len(attempts) > 1
 	var lastIncompatible error
-	for i, attempt := range attempts {
+	var kiroIssue *kiroCompatibilityIssue
+	kiroPreflightChecked := false
+	requestStarted := time.Now()
+	for i := 0; i < len(attempts); i++ {
+		i = h.comboAttemptIndexForBudget(ctx, requestStarted, attempts, i, routeName)
+		attempt := attempts[i]
 		if isKiroServer3Candidate(attempt.Model) {
-			if issue := kiroPayloadCompatibilityIssue(rawJSON); issue != nil {
+			if !kiroPreflightChecked {
+				kiroIssue = kiroPayloadCompatibilityIssue(rawJSON)
+				kiroPreflightChecked = true
+			}
+			if issue := kiroIssue; issue != nil {
 				lastIncompatible = incompatibleKiroPayloadError(attempt.Model, issue.Reason)
 				h.recordIncompatiblePayloadSkip(ctx, routeName, i, attempt.Model, isCombo, issue)
 				continue
@@ -987,13 +996,18 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	dataChan := make(chan []byte)
 	errChan := make(chan *interfaces.ErrorMessage, 1)
 	headers := make(http.Header)
+	requestStarted := time.Now()
 
 	go func() {
 		defer close(dataChan)
 		defer close(errChan)
 
 		var lastErr *interfaces.ErrorMessage
-		for i, attempt := range attempts {
+		var kiroIssue *kiroCompatibilityIssue
+		kiroPreflightChecked := false
+		for i := 0; i < len(attempts); i++ {
+			i = h.comboAttemptIndexForBudget(ctx, requestStarted, attempts, i, routeName)
+			attempt := attempts[i]
 			if ctx != nil {
 				select {
 				case <-ctx.Done():
@@ -1002,7 +1016,11 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				}
 			}
 			if isKiroServer3Candidate(attempt.Model) {
-				if issue := kiroPayloadCompatibilityIssue(rawJSON); issue != nil {
+				if !kiroPreflightChecked {
+					kiroIssue = kiroPayloadCompatibilityIssue(rawJSON)
+					kiroPreflightChecked = true
+				}
+				if issue := kiroIssue; issue != nil {
 					h.recordIncompatiblePayloadSkip(ctx, routeName, i, attempt.Model, true, issue)
 					lastErr = &interfaces.ErrorMessage{StatusCode: http.StatusUnprocessableEntity, Error: incompatibleKiroPayloadError(attempt.Model, issue.Reason)}
 					continue
@@ -2068,8 +2086,11 @@ func (h *BaseAPIHandler) recordIncompatiblePayloadSkip(ctx context.Context, comb
 		"message_count":          issue.MessageCount,
 		"tool_count":             issue.ToolCount,
 		"tool_names_sample":      issue.ToolNamesSample,
+		"payload_bytes":          issue.PayloadBytes,
+		"image_count":            issue.ImageCount,
+		"max_image_bytes":        issue.MaxImageBytes,
 	}).Infof(
-		"skipping Kiro candidate during compatibility preflight: combo=%q candidate=%q routing_reason=incompatible_payload incompatibility_reason=%q detail=%q tool=%q messages=%d tools=%d tool_sample=%q",
+		"skipping Kiro candidate during compatibility preflight: combo=%q candidate=%q routing_reason=incompatible_payload incompatibility_reason=%q detail=%q tool=%q messages=%d tools=%d tool_sample=%q payload_bytes=%d images=%d max_image_bytes=%d",
 		comboName,
 		candidateModel,
 		issue.Reason,
@@ -2078,6 +2099,9 @@ func (h *BaseAPIHandler) recordIncompatiblePayloadSkip(ctx context.Context, comb
 		issue.MessageCount,
 		issue.ToolCount,
 		strings.Join(issue.ToolNamesSample, ","),
+		issue.PayloadBytes,
+		issue.ImageCount,
+		issue.MaxImageBytes,
 	)
 	if isCombo && h != nil && h.ComboMetrics != nil {
 		h.ComboMetrics.Record(comboName, entryIndex, false, 0, "incompatible_payload")
