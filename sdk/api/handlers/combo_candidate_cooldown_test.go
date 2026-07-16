@@ -1,11 +1,27 @@
 package handlers
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/resilience"
 )
+
+func TestCommittedComboAttemptCancellationIsNeutral(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	record, success, reason := committedComboAttemptOutcome(ctx, false, false)
+	if record || success || reason != "client_canceled" {
+		t.Fatalf("record=%v success=%v reason=%q, want neutral client cancellation", record, success, reason)
+	}
+
+	record, success, reason = committedComboAttemptOutcome(context.Background(), false, false)
+	if !record || !success || reason != "" {
+		t.Fatalf("record=%v success=%v reason=%q, want healthy completion", record, success, reason)
+	}
+}
 
 func TestComboCandidateCooldownTripsAndRecovers(t *testing.T) {
 	r := newComboCandidateCooldownRegistry(resilience.Config{

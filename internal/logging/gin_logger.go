@@ -4,6 +4,7 @@
 package logging
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -81,7 +82,8 @@ func GinLogrusLogger() gin.HandlerFunc {
 			latency = latency.Truncate(time.Millisecond)
 		}
 
-		statusCode := c.Writer.Status()
+		upstreamStatus := c.Writer.Status()
+		statusCode, outcome := requestLogOutcome(c.Request.Context(), upstreamStatus)
 		clientIP := c.ClientIP()
 		method := c.Request.Method
 		errorMessage := c.Errors.ByType(gin.ErrorTypePrivate).String()
@@ -90,6 +92,9 @@ func GinLogrusLogger() gin.HandlerFunc {
 			requestID = "--------"
 		}
 		logLine := fmt.Sprintf("%3d | %13v | %15s | %-7s \"%s\"", statusCode, latency, clientIP, method, path)
+		if outcome != "" {
+			logLine += fmt.Sprintf(" | outcome=%s upstream_status=%d", outcome, upstreamStatus)
+		}
 		if creditsUsed(c) {
 			logLine += " [credits]"
 		}
@@ -108,6 +113,19 @@ func GinLogrusLogger() gin.HandlerFunc {
 			entry.Info(logLine)
 		}
 	}
+}
+
+// requestLogOutcome separates the HTTP status already committed on the wire
+// from the actual request outcome. Streaming handlers commonly commit 200
+// before the downstream disconnects, while pre-header cancellation can surface
+// as 500. Neither status describes provider health once the request context is
+// cancelled, so logs use the conventional 499 code and an explicit outcome.
+// This changes observability only; it never rewrites the HTTP response.
+func requestLogOutcome(ctx context.Context, upstreamStatus int) (int, string) {
+	if ctx != nil && (errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+		return 499, "client_disconnected"
+	}
+	return upstreamStatus, ""
 }
 
 // isAIAPIPath checks if the given path is an AI API endpoint that should have request ID tracking.

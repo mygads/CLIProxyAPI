@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,21 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+func TestRequestLogOutcomeClassifiesDownstreamCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	status, outcome := requestLogOutcome(ctx, http.StatusOK)
+	if status != 499 || outcome != "client_disconnected" {
+		t.Fatalf("status=%d outcome=%q, want 499 client_disconnected", status, outcome)
+	}
+
+	status, outcome = requestLogOutcome(context.Background(), http.StatusInternalServerError)
+	if status != http.StatusInternalServerError || outcome != "" {
+		t.Fatalf("live status=%d outcome=%q, want 500 with no override", status, outcome)
+	}
+}
 
 func TestGinLogrusRecoveryRepanicsErrAbortHandler(t *testing.T) {
 	gin.SetMode(gin.TestMode)

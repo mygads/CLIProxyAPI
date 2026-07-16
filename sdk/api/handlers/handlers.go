@@ -1080,15 +1080,11 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				//     instant the bootstrap timer fired, so the select may have
 				//     cancelled the attempt even though it technically committed
 				//     (a nanosecond-wide race at exactly comboAttemptTimeout).
-				switch {
-				case idleStalled.Load():
-					h.recordComboAttempt(routeName, i, attempt.Model, true, false, start, "idle_timeout")
-				case bootstrapTimedOut.Load():
-					h.recordComboAttempt(routeName, i, attempt.Model, true, false, start, "timeout")
-				default:
+				record, success, reason := committedComboAttemptOutcome(ctx, idleStalled.Load(), bootstrapTimedOut.Load())
+				if record {
 					// Live stream owns attemptCtx for its full lifetime; it
 					// shares the parent's cancellation. Do NOT cancel here.
-					h.recordComboAttempt(routeName, i, attempt.Model, true, true, start, "")
+					h.recordComboAttempt(routeName, i, attempt.Model, true, success, start, reason)
 				}
 				return
 			}
@@ -1147,6 +1143,23 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	}()
 
 	return dataChan, headers, errChan
+}
+
+// committedComboAttemptOutcome returns whether a committed stream should be
+// included in provider metrics. A downstream cancellation is neutral: the
+// provider may have been healthy, but the caller left before completion. It
+// must count as neither success nor failure and must not affect cooldown.
+func committedComboAttemptOutcome(ctx context.Context, idleStalled, bootstrapTimedOut bool) (record, success bool, reason string) {
+	if ctx != nil && ctx.Err() != nil {
+		return false, false, "client_canceled"
+	}
+	if idleStalled {
+		return true, false, "idle_timeout"
+	}
+	if bootstrapTimedOut {
+		return true, false, "timeout"
+	}
+	return true, true, ""
 }
 
 func emptyUpstreamResponseError(model string) *interfaces.ErrorMessage {
