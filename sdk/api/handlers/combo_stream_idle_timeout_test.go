@@ -196,7 +196,10 @@ func TestExecuteStreamWithAuthManager_PostCommitIdleStallBounded(t *testing.T) {
 }
 
 func TestComboStreamIdleTimeoutDefaultAllowsLongThinkingGap(t *testing.T) {
-	h := &BaseAPIHandler{}
+	// Production always wires a non-nil SDKConfig. Keep this regression test
+	// on that path so the config package default cannot silently diverge from
+	// the handler fallback again.
+	h := &BaseAPIHandler{Cfg: &sdkconfig.SDKConfig{}}
 	if got := h.comboStreamIdleTimeout(); got < 120*time.Second {
 		t.Fatalf("default stream idle timeout=%s, want at least 120s for thinking providers", got)
 	}

@@ -96,7 +96,9 @@ const defaultComboAttemptTimeout = 120 * time.Second
 // defaultComboStreamIdleTimeout independently bounds a post-commit stall
 // (stream already producing, then goes silent). The timer resets on every
 // upstream byte, so a long but steadily-producing generation is not cut short.
-const defaultComboStreamIdleTimeout = 60 * time.Second
+// Thinking providers can legitimately pause for more than a minute after
+// emitting content, so match the 120-second bootstrap allowance by default.
+const defaultComboStreamIdleTimeout = 120 * time.Second
 
 // ComboAttemptTimeout returns the configured per-attempt combo timeout.
 // Defaults to 120s if not set or zero.
@@ -108,7 +110,7 @@ func (c *SDKConfig) ComboAttemptTimeout() time.Duration {
 }
 
 // ComboStreamIdleTimeout returns the configured post-commit combo idle timeout.
-// Defaults to 60s if not set or zero.
+// Defaults to 120s if not set or zero.
 func (c *SDKConfig) ComboStreamIdleTimeout() time.Duration {
 	if c == nil || c.ComboStreamIdleTimeoutSeconds <= 0 {
 		return defaultComboStreamIdleTimeout
